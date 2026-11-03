@@ -17,21 +17,20 @@ batch developing and a faster engine.
 <img src="docs/screens/developing.png" width="32%" alt="Developing">
 </p>
 
-> ⚠️ **Beta.** Unofficial code on a 2009 camera. It only runs on the exact
-> setup below, and it can delete files (see output modes). Try it on a card
-> you don't mind wiping first.
+> **This is a beta.** It's unofficial code on a 2009 camera, it only runs on
+> the exact setup below, and it can delete files (see output modes). Try it on
+> a card you don't mind wiping first. Like all GPL software it comes with no
+> warranty: you install it at your own risk (sections 11 and 12 of the
+> [licence](LICENSE)).
 
-> ⚖️ **No warranty.** Like all GPL software this comes with none. You install
-> it at your own risk. See sections 11 and 12 of the [licence](LICENSE).
-
-> 🎨 **The looks are interpretations.** The names are shorthand for the films
-> they're based on, not exact copies. All trademarks belong to their owners.
-> Stocks marked EXPERIMENTAL are new in this port and still being tuned.
+The film names are shorthand for the stocks the looks are based on, not exact
+copies. All trademarks belong to their owners. Stocks marked EXPERIMENTAL are
+new in this port and still being tuned.
 
 ## What you need
 
-- An **original EOS 7D** (not the Mark II) on Canon firmware **2.0.3**.
-- **Magic Lantern `lua_fix.2020Dec28.7D203`** already installed and working
+- An original EOS 7D (not the Mark II) on Canon firmware 2.0.3.
+- Magic Lantern `lua_fix.2020Dec28.7D203` already installed and working
   ([builds.magiclantern.fm/7D.html](https://builds.magiclantern.fm/7D.html),
   install guide on the ML wiki). Other ML builds are untested: the module only
   uses symbols exported by that build.
@@ -43,7 +42,7 @@ batch developing and a faster engine.
    with the `ML` folder already there. It adds `ML/modules/soup7d.mo` and
    `ML/FILM/` (the 27 stocks and `INDEX.TXT`). Nothing else on the card changes.
 2. In the camera, open the ML menu → **Modules**, enable **soup7d**, restart.
-3. The first boot after adding the module may show **Err 70**. Turn the camera
+3. The first boot after adding the module may show Err 70. Turn the camera
    off and on once: it's Canon's file catalogue rebuilding, not the module.
 
 To remove it, delete `ML/modules/soup7d.mo` (and `ML/FILM`, `ML/SOUP` if you like).
@@ -64,19 +63,19 @@ The develop menu offers **PICK** (browse frames with a thumbnail), **LATEST**,
 **ALL NEW** (everything since the last frame you developed) and **LAST N**.
 A half-press cancels a develop; a cancelled frame is left untouched.
 
-**Size:** HALF (2592 px wide) or FULL (5184 px, about four times as long).
+Size is HALF (2592 px wide) or FULL (5184 px, about four times as long).
 
-**Output modes:**
+The output mode decides what happens to the camera's files:
 
 | Mode | What happens |
 | --- | --- |
-| **JPEG ONLY** (default) | The developed JPEG replaces the camera's JPEG under the same name, and the RAW is **deleted** (only after the new file is checked). One finished picture per frame. |
+| JPEG ONLY (default) | The developed JPEG replaces the camera's JPEG under the same name, and the RAW is **deleted** (only after the new file is checked). One finished picture per frame. |
 | REPLACE JPEG | The developed JPEG replaces the camera's JPEG; the RAW is kept. Playback still shows the RAW's preview. |
 | NEW JPEG | A new file next to the originals, under the next free number. Originals kept. |
 | NEW JPEG + DELETE RAW | As NEW JPEG, then deletes the RAW if a full-size camera JPEG is kept. |
 | ML/SOUP FOLDER | New file in `ML/SOUP/`. Originals kept. |
 
-**Auto develop** (off by default) develops each new shot a couple of seconds
+Auto develop (off by default) develops each new shot a couple of seconds
 after you stop shooting, with the current film.
 
 Developed files carry `SOUP ENGINE - <film> #<frame>` in the EXIF Software tag,
@@ -84,14 +83,14 @@ and are never developed twice: a frame can only be developed again from its RAW.
 
 ### Speed
 
-About **17 s** a frame at HALF from RAW+S with Live View off (T-MAX 400; colour
+About 17 s a frame at HALF from RAW+S with Live View off (T-MAX 400; colour
 stocks with halation and grain take a little longer, up to ~23 s). Live View on
 roughly doubles it. The engine has no FPU or hardware divide to lean on, so it
 is all integer code.
 
 ### Things the camera does that you should know
 
-- **New files show up in playback after a restart.** Canon only lists files it
+- New files show up in playback after a restart. Canon only lists files it
   wrote itself or found at power-on. JPEG ONLY frames show their developed
   picture after you turn the camera off and on.
 - Playback of a RAW+JPEG pair shows the RAW's embedded preview, so a developed
@@ -119,7 +118,7 @@ file in and add its name to `INDEX.TXT`.
 ## Building
 
 You need `arm-none-eabi-gcc` (tested with 16.2) and the Magic Lantern source
-at changeset **7e5067c0a8cf**, the one `lua_fix.2020Dec28.7D203` was built
+at changeset `7e5067c0a8cf`, the one `lua_fix.2020Dec28.7D203` was built
 from. Only its headers are used.
 
 ```bash
