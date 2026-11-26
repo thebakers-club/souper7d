@@ -82,6 +82,8 @@ int main(int argc,char**argv){
   const char *L1[]={"/.","SB7D0100.CR2","SB7D0100.JPG","_B7D0525.CR2","_B7D0526.JPG","_B7D0527.CR2","_B7D0527.JPG",
                     "_B7D0528.JPG","SOUP0526.JPG","SOU20526.JPG","_B7D0529.CR2","SB7D0529.CR2","_B7D0530.JPG","NOTES.TXT",0};
   memcpy(dcim_list,L1,sizeof L1); soup_list[0]=0; card.file_number=530;
+  mf_add("A:/DCIM/100EOS7D/SOUP0526.JPG","SOUP ENGINE - OLD");
+  mf_add("A:/DCIM/100EOS7D/SOU20526.JPG","SOUP ENGINE - OLD");
   assert(index_build()==0&&open_dirs==0);
   assert(nframes==7);                          /* 100,525,526,527,528,529,530 ; SOUP files are not frames */
   int i26=frame_lookup(526); assert(i26>=0&&frames[i26].done==1&&frames[i26].flags==F_JPG);
@@ -96,6 +98,7 @@ int main(int argc,char**argv){
   assert(index_build()==0); k=select_new(sel,200); assert(k==1&&sel[0]==2);
   /* outputs kept in ML/SOUP count as developed too */
   soup_list[0]="SOUP0002.JPG"; soup_list[1]="SOUP0999.JPG"; soup_list[2]=0;
+  mf_add("ML/SOUP/SOUP0002.JPG","SOUP ENGINE @0F4242/100EOS7D/_B7D - TEST #0002");
   assert(index_build()==0&&nframes==3); k=select_new(sel,200); assert(k==1&&sel[0]==3);
   /* unreadable folder */
   dcim_list[0]=0; assert(index_build()==0&&nframes==0&&select_new(sel,200)==0&&select_last(sel,200,5)==0);

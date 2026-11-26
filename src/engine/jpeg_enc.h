@@ -18,7 +18,12 @@
 /* Sink for encoded bytes. Returns 0 on success. */
 typedef int (*se_jpeg_sink)(void *ctx, const uint8_t *data, size_t len);
 
+typedef enum {
+    SE_JPEG_COLOR, SE_JPEG_TRANSFORM, SE_JPEG_ENTROPY, SE_JPEG_OTHER
+} se_jpeg_phase;
+
 #define SE_JPEG_MCU 8
+#define SE_JPEG_BATCH_MCUS 1
 
 /*
  * Metadata written as an EXIF APP1 block. Two reasons this matters: the
@@ -43,16 +48,17 @@ typedef struct {
 typedef struct {
     se_jpeg_sink sink;
     void        *ctx;
+    /* Optional after begin. Reports batch boundaries using the sink context. */
+    void (*mark_phase)(void *ctx, se_jpeg_phase phase);
 
     int width, height;
     int stride;          /* source row length; may be wider than width */
     int quality;
 
     uint8_t  qt[2][64];        /* natural order    */
-    uint32_t qrecip[2][64];    /* Q16 reciprocals  */
+    int32_t  qrecip[2][64];    /* Q16 reciprocals  */
 
     /* bit assembly */
-    uint32_t qzero[2][64];   /* |v| <= this quantises to 0, see encode_block */
     uint32_t bitbuf;
     int      bitcnt;
 
@@ -69,7 +75,12 @@ typedef struct {
     uint8_t  out[4096];
     int      outpos;
 
-    uint8_t  exifbuf[8192];
+    /* After APP1, reuse this space for the current batch of 4:2:2 MCUs
+     * (two Y blocks followed by Cb and Cr per MCU). */
+    union {
+        uint8_t exifbuf[8192];
+        int32_t mcu[SE_JPEG_BATCH_MCUS][4][64];
+    };
 } se_jpeg;
 
 /*

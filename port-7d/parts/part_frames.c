@@ -7,9 +7,9 @@
  *
  * Outputs: SOUP####.JPG with the NEXT FREE number, because Canon playback
  * hides a JPG that shares its number with another image (DCF: one number,
- * one image). The source frame is in the output's EXIF Software tag as
- * "#nnnn". Older outputs (SOUP/SOU2..SOU9 with the source's own number and
- * no "#") still count, by their number. Canon only learns about our numbers
+ * one image). EXIF Software records the source folder and frame. Older outputs
+ * with a bare "#nnnn" or no source tag count only in their own DCIM folder.
+ * Canon only learns about our numbers
  * at its next boot, so it may reuse one for a shot meanwhile; the scan then
  * renames OUR file to a free number. Camera files are never renamed.
  *
@@ -45,6 +45,41 @@ static void frames_release(void)
 static char frames_dir[64];
 
 static char up_ascii(char c){return (c>='a'&&c<='z')?(char)(c-32):c;}
+
+static int dcim_folder_number(const char *folder)
+{
+    int i, number = 0;
+    if (strlen(folder) != 8) return -1;
+    for (i = 0; i < 3; i++) {
+        if (folder[i] < '0' || folder[i] > '9') return -1;
+        number = number * 10 + folder[i] - '0';
+    }
+    return number >= 100 ? number : -1;
+}
+
+/* Six hex digits hold all DCF folder/frame pairs. The folder name and
+ * four-character file prefix distinguish renamed folders and custom prefixes. */
+static void format_source_tag(char *tag, int cap, const char *stock, const char prefix[4], int num)
+{
+    const char *slash = strrchr(frames_dir, '/');
+    const char *folder = slash ? slash + 1 : frames_dir;
+    int number = dcim_folder_number(folder);
+    static const char hex[] = "0123456789ABCDEF";
+    char id[7], name[5];
+    int i, code;
+
+    if (number < 0) {
+        snprintf(tag, cap, "SOUP ENGINE - %s #%04d", stock, num);
+        return;
+    }
+    code = number * 10000 + num;
+    for (i = 0; i < 6; i++) id[i] = hex[(code >> (20 - 4 * i)) & 15];
+    id[6] = 0;
+    memcpy(name, prefix, 4);
+    name[4] = 0;
+    snprintf(tag, cap, "SOUP ENGINE @%s/%s/%s - %s #%04d", id, folder, name, stock, num);
+}
+
 static int parse_dcim_name(const char *n,int *num,char ext[4])
 {
     int i,v=0;
@@ -112,28 +147,61 @@ static void out_path(const out_ent *o,int num,char *out,int cap,const char *ext)
     if(o->ver<=1)snprintf(out,cap,"%s/SOUP%04d.%s",o->in_ml?"ML/SOUP":frames_dir,num,ext);
     else snprintf(out,cap,"%s/SOU%d%04d.%s",o->in_ml?"ML/SOUP":frames_dir,o->ver,num,ext);
 }
-/* Source frame recorded in an output's EXIF ("SOUP ENGINE - <stock> #nnnn"),
- * or -1 for an older output without one. Only the first 1 KB is read. */
-static int read_src(const char *path,uint8_t *buf,int cap)
+enum { SRC_INVALID = -1, SRC_UNTAGGED, SRC_LEGACY, SRC_QUALIFIED };
+typedef struct { int num; char folder[9]; char prefix[4]; } source_ref;
+
+static int parse_source_id(const uint8_t *s, int len, source_ref *ref)
 {
-    FILE *f;uint32_t size=0,n;int i,v;
-    if(FIO_GetFileSize(path,&size)!=0||size<64)return -1;
+    int code = 0, i, folder;
+    if (len < 22 || s[7] != '/' || s[16] != '/' || s[21] != ' ') return SRC_INVALID;
+    for (i = 1; i <= 6; i++) {
+        char c = up_ascii(s[i]);
+        if (c >= '0' && c <= '9') code = code * 16 + c - '0';
+        else if (c >= 'A' && c <= 'F') code = code * 16 + c - 'A' + 10;
+        else return SRC_INVALID;
+    }
+    memcpy(ref->folder, s + 8, 8);
+    ref->folder[8] = 0;
+    folder = dcim_folder_number(ref->folder);
+    ref->num = code % 10000;
+    if (folder < 0 || folder != code / 10000 || ref->num == 0) return SRC_INVALID;
+    memcpy(ref->prefix, s + 17, 4);
+    return SRC_QUALIFIED;
+}
+
+/* EXIF Software is close to the start of files written by our encoder. */
+static int read_src(const char *path,uint8_t *buf,int cap, source_ref *ref)
+{
+    FILE *f;uint32_t size=0,n;int i;
+    if(FIO_GetFileSize(path,&size)!=0||size<64)return SRC_INVALID;
     n=size<(uint32_t)cap?size:(uint32_t)cap;
-    f=FIO_OpenFile(path,O_RDONLY);if(!good_file(f))return -1;
-    if(read_exact(f,0,buf,n)!=0){FIO_CloseFile(f);return -1;}
+    f=FIO_OpenFile(path,O_RDONLY);if(!good_file(f))return SRC_INVALID;
+    if(read_exact(f,0,buf,n)!=0){FIO_CloseFile(f);return SRC_INVALID;}
     FIO_CloseFile(f);
     for(i=0;i+11<(int)n;i++){
+        int end;
         if(memcmp(buf+i,"SOUP ENGINE",11))continue;
-        for(;i+5<(int)n&&buf[i];i++){
+        end=i+11;
+        while(end<(int)n&&buf[end])end++;
+        if(end>i+12&&buf[i+11]==' '&&buf[i+12]=='@')
+            return parse_source_id(buf+i+12,end-i-12,ref);
+        for(i+=11;i+4<end;i++){
             if(buf[i]=='#'&&buf[i+1]>='0'&&buf[i+1]<='9'&&buf[i+2]>='0'&&buf[i+2]<='9'&&
                buf[i+3]>='0'&&buf[i+3]<='9'&&buf[i+4]>='0'&&buf[i+4]<='9'){
-                v=(buf[i+1]-'0')*1000+(buf[i+2]-'0')*100+(buf[i+3]-'0')*10+(buf[i+4]-'0');
-                return v>=1?v:-1;
+                ref->num=(buf[i+1]-'0')*1000+(buf[i+2]-'0')*100+(buf[i+3]-'0')*10+(buf[i+4]-'0');
+                return ref->num>=1?SRC_LEGACY:SRC_INVALID;
             }
         }
-        return -1;
+        break;
     }
-    return -1;
+    return SRC_UNTAGGED;
+}
+
+static int same_name(const char *a, const char *b, int len)
+{
+    int i;
+    for (i = 0; i < len; i++) if (up_ascii(a[i]) != up_ascii(b[i])) return 0;
+    return 1;
 }
 /* 1 if the file's first `cap` bytes carry our EXIF Software tag. */
 static int soup_marked(const char *path,uint8_t *buf,int cap)
@@ -177,30 +245,43 @@ static int next_output(int in_ml,char *out,char *tmp,int cap)
 /* Rebuild the index for the current shooting folder. Never while a job runs. */
 static int index_build(void)
 {
-    int i,j,at,src;uint8_t *buf;char p[96],q[96],tq[96];
+    int i,j,at;uint8_t *buf;char p[96],q[96],tq[96];
+    const char *folder;
     if(!frames){
         frames=malloc(MAX_FRAMES*sizeof(frame_ent)+MAX_OUTS*sizeof(out_ent));if(!frames)return -1;
         outs=(out_ent*)(frames+MAX_FRAMES);
     }
     nframes=0;frames_overflow=0;nouts=0;max_cam=0;max_ml=0;
     snprintf(frames_dir,sizeof(frames_dir),"%s",get_dcim_dir());
+    folder=strrchr(frames_dir,'/');
+    folder=folder?folder+1:frames_dir;
     if(scan_dir(frames_dir,0)!=0)return -1;
     scan_dir("ML/SOUP",1);             /* outputs kept there count as developed */
     buf=fio_malloc(1024);
     for(i=0;i<nouts;i++){
         out_ent *o=&outs[i];
+        source_ref ref;
+        int kind, source_at=-1;
+        if(!buf)break;
         out_path(o,o->num,p,sizeof(p),"JPG");
-        src=buf?read_src(p,buf,1024):-1;
-        if(src<0)src=o->num;           /* older output: its own number is the source */
+        kind=read_src(p,buf,1024,&ref);
+        if(kind==SRC_QUALIFIED&&strlen(folder)==8&&same_name(folder,ref.folder,8)){
+            at=frame_lookup(ref.num);
+            if(at>=0&&(((frames[at].flags&F_CR2)&&same_name(frames[at].cr2p,ref.prefix,4))||
+                       ((frames[at].flags&F_JPG)&&same_name(frames[at].jpgp,ref.prefix,4))))source_at=at;
+        }else if(!o->in_ml&&(kind==SRC_LEGACY||kind==SRC_UNTAGGED)){
+            source_at=frame_lookup(kind==SRC_LEGACY?ref.num:o->num);
+        }
         /* Canon reused our number for a real shot: move OUR file out of the way */
-        if(!o->in_ml&&src!=o->num&&(at=frame_lookup(o->num))>=0&&(frames[at].flags&(F_CR2|F_JPG))){
+        if(!o->in_ml&&(kind==SRC_QUALIFIED||(kind==SRC_LEGACY&&ref.num!=o->num))&&
+           (at=frame_lookup(o->num))>=0&&at!=source_at&&(frames[at].flags&(F_CR2|F_JPG))){
             int nn=next_output(0,q,tq,sizeof(q));
             if(nn>0){
                 out_ent t=*o;t.ver=1;out_path(&t,nn,q,sizeof(q),"JPG");
                 if(FIO_RenameFile(p,q)==0){char d_[224];snprintf(d_,sizeof(d_),"renamed %s -> %s (camera reused the number)",p,q);diag(d_);diag_flush();o->num=(uint16_t)nn;o->ver=1;}
             }
         }
-        if((at=frame_lookup(src))>=0)frames[at].done=1;
+        if(source_at>=0)frames[source_at].done=1;
     }
     /* Interrupted in-place swaps: the TMP is the develop, the JPG is gone.
      * Finish the rename -- only for a complete JPEG; a cut-off one is a

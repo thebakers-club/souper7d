@@ -292,8 +292,9 @@ void se_look_from_stock(const se_stock *s, int scale, se_look *lk)
 
 /* ------------------------------------------------------- the run ----- */
 
-#define LOOK_MEMO         4096
-#define LOOK_MEMO_HASH(k) (((k) * 2654435761u) >> 20)   /* top 12 bits */
+enum { LOOK_MEMO_BITS = 12, LOOK_MAX_MASK_ROWS = 2 * 48 + 1 };
+
+typedef struct { uint32_t key, rgb; } look_memo_entry;
 
 struct se_look_run {
     se_look  lk;
@@ -324,6 +325,12 @@ struct se_look_run {
     uint8_t  mask[256];       /* halation mask per luma, see mask_row     */
     int16_t  glow[256];       /* blurred mask -> glow amount, add_glow    */
     int16_t  hue_mod[1536][3];/* per-hue sat, lum, rot, interpolated      */
+    int      skip_empty_halation;
+    int      lit_rows;
+    uint8_t  mask_present[LOOK_MAX_MASK_ROWS];
+    int split_delta[256][3];
+    unsigned memo_shift;
+    se_look_timing *timing;
     /*
      * Recently graded colours, keyed by the source pixel. The grade is a
      * pure function of the pixel, so a hit is exactly what grade_px would
@@ -332,12 +339,12 @@ struct se_look_run {
      * colours recur: sky, skin, shadow). Colour stocks only; mono has its
      * own table.
      */
-    struct { uint32_t key; uint8_t px[4]; } memo[LOOK_MEMO];
+    look_memo_entry memo[];
 };
 
 static inline __attribute__((always_inline))
-void grade_px(const se_look *lk, const int16_t (*hue_mod)[3],
-              int rr, int gg, int bb, uint8_t *out);
+uint32_t grade_px(int hue_any, int sat, const int16_t (*hue_mod)[3],
+                  int rr, int gg, int bb, const int (*split_delta)[3]);
 static void grade_row(se_look_run *r, const uint8_t *src, uint8_t *dst,
                       int w);
 
@@ -361,7 +368,15 @@ static size_t look_core_bytes(const se_look *lk, int width)
 
 size_t se_look_bytes(const se_look *lk, int width)
 {
-    return look_core_bytes(lk, width) + LOOK_RUN_TABLES;
+    return look_core_bytes(lk, width) + LOOK_RUN_TABLES +
+           (1u << LOOK_MEMO_BITS) * sizeof(look_memo_entry);
+}
+
+size_t se_look_cache_extra(int cache)
+{
+    if (cache <= SE_LOOK_CACHE_4K || cache >= SE_LOOK_CACHE_COUNT) return 0;
+    return ((1u << (LOOK_MEMO_BITS + cache)) - (1u << LOOK_MEMO_BITS)) *
+           sizeof(look_memo_entry);
 }
 
 size_t se_look_fit(se_look *lk, int width, size_t budget)
@@ -381,12 +396,16 @@ size_t se_look_fit(se_look *lk, int width, size_t budget)
     return se_look_bytes(lk, width);
 }
 
-se_err se_look_begin(se_look_run **out, const se_look *lk,
-                     int width, se_arena *ar)
+se_err se_look_begin_with_options(se_look_run **out, const se_look *lk,
+                                  int width, se_arena *ar, int cache,
+                                  int skip_empty_halation)
 {
     se_look_run *r;
+    unsigned memo_count;
+    size_t run_bytes;
 
     if (!out || !lk || width <= 0 || !ar) return SE_E_CORRUPT;
+    if (cache < SE_LOOK_CACHE_4K || cache >= SE_LOOK_CACHE_COUNT) return SE_E_CORRUPT;
 
     /*
      * Also here, not only in se_look_from_stock.
@@ -400,11 +419,14 @@ se_err se_look_begin(se_look_run **out, const se_look *lk,
      */
     tables_init();
 
-    r = SE_NEW(ar, se_look_run, 1);
+    memo_count = 1u << (LOOK_MEMO_BITS + cache);
+    run_bytes = sizeof *r + memo_count * sizeof(r->memo[0]);
+    r = se_arena_alloc(ar, run_bytes, 8);
     if (!r) return SE_E_NOMEM;
-    memset(r, 0, sizeof *r);
+    memset(r, 0, run_bytes);
     r->lk = *lk;
     r->w  = width;
+    r->memo_shift = 32 - (LOOK_MEMO_BITS + cache);
 
     /* Halation: the mask for each luma (how far above the threshold,
      * scaled so 255 is 255), and the glow for each blurred mask value. */
@@ -438,6 +460,11 @@ se_err se_look_begin(se_look_run **out, const se_look *lk,
                 + (((lk->hue_rot[nx] - lk->hue_rot[sec]) * f) >> 8));
         }
     }
+    /* Split-tone offsets depend only on the clamped luminance. */
+    for (int y = 0; y < 256; y++)
+        for (int c = 0; c < 3; c++)
+            r->split_delta[y][c] = (lk->sh[c] * (255 - y) + lk->hi[c] * y) >> 8;
+
     /* With saturation 0 the saturation stage leaves (y, y, y), y the luma
      * of the curve output, and luma8(y, y, y) == y, so the rest of the
      * chain run on (y, y, y) is exactly what every pixel of luma y gets. */
@@ -458,13 +485,14 @@ se_err se_look_begin(se_look_run **out, const se_look *lk,
     /* empty the memo (after the mono table, which grades with identity
      * curves): no pixel has bits above 23, so this key never matches */
     {
-        int i;
-        for (i = 0; i < LOOK_MEMO; i++) r->memo[i].key = 0xFFFFFFFFu;
+        unsigned i;
+        for (i = 0; i < memo_count; i++) r->memo[i].key = 0xFFFFFFFFu;
     }
 
     if (lk->hal_amount > 0) {
         r->r      = lk->hal_radius;
         r->nring  = 2 * r->r + 1;
+        r->skip_empty_halation = skip_empty_halation && r->nring <= LOOK_MAX_MASK_ROWS;
         /*
          * The mask window spans 2r+1 rows, but the graded RGB does not.
          * A row is written at push index i and read back at push index
@@ -492,11 +520,16 @@ se_err se_look_begin(se_look_run **out, const se_look *lk,
     return SE_OK;
 }
 
+se_err se_look_begin(se_look_run **out, const se_look *lk, int width, se_arena *ar)
+{
+    return se_look_begin_with_options(out, lk, width, ar, SE_LOOK_CACHE_4K, 0);
+}
+
 /* Everything after the curves for one pixel: the per-hue stage, saturation,
  * split tone, chroma rolloff and the gamut fit. rr, gg, bb are curve output. */
 static inline __attribute__((always_inline))
-void grade_px(const se_look *lk, const int16_t (*hue_mod)[3],
-              int rr, int gg, int bb, uint8_t *out)
+uint32_t grade_px(int hue_any, int sat, const int16_t (*hue_mod)[3],
+                  int rr, int gg, int bb, const int (*split_delta)[3])
 {
     /*
      * The per-hue stage, on the colour the curves produced.
@@ -513,7 +546,7 @@ void grade_px(const se_look *lk, const int16_t (*hue_mod)[3],
      * whole block is skipped when a stock asks for nothing per-hue,
      * rather than relying on it round-tripping to the same bytes.
      */
-    if (lk->hue_any) {
+    if (hue_any) {
         int chroma;
         int h = hue1536(rr, gg, bb, &chroma);
         if (h >= 0) {
@@ -558,20 +591,18 @@ void grade_px(const se_look *lk, const int16_t (*hue_mod)[3],
         }
     }
 
-    if (lk->sat != 256) {
+    if (sat != 256) {
         int y = luma8(clamp8(rr), clamp8(gg), clamp8(bb));
-        rr = y + (((rr - y) * lk->sat) >> 8);
-        gg = y + (((gg - y) * lk->sat) >> 8);
-        bb = y + (((bb - y) * lk->sat) >> 8);
+        rr = y + (((rr - y) * sat) >> 8);
+        gg = y + (((gg - y) * sat) >> 8);
+        bb = y + (((bb - y) * sat) >> 8);
     }
 
-    if (lk->sh[0] | lk->sh[1] | lk->sh[2] |
-        lk->hi[0] | lk->hi[1] | lk->hi[2]) {
-        int y  = luma8(clamp8(rr), clamp8(gg), clamp8(bb));
-        int wl = 255 - y;                  /* shadow weight    */
-        rr += (lk->sh[0] * wl + lk->hi[0] * y) >> 8;
-        gg += (lk->sh[1] * wl + lk->hi[1] * y) >> 8;
-        bb += (lk->sh[2] * wl + lk->hi[2] * y) >> 8;
+    if (split_delta) {
+        int y = luma8(clamp8(rr), clamp8(gg), clamp8(bb));
+        rr += split_delta[y][0];
+        gg += split_delta[y][1];
+        bb += split_delta[y][2];
     }
 
     /*
@@ -593,19 +624,14 @@ void grade_px(const se_look *lk, const int16_t (*hue_mod)[3],
     }
 
     gamut_fit(&rr, &gg, &bb);
-    out[0] = (uint8_t)clamp8(rr);
-    out[1] = (uint8_t)clamp8(gg);
-    out[2] = (uint8_t)clamp8(bb);
+    return (uint32_t)clamp8(rr) | (uint32_t)clamp8(gg) << 8 | (uint32_t)clamp8(bb) << 16;
 }
 
 /*
  * Curves, saturation and split tone: everything that needs only the pixel
  * itself. src may be dst.
  *
- * The look is copied to a local first. The row is bytes, and a byte store
- * may alias anything, so through the pointer every field of the look was
- * loaded again for every pixel; a local whose address never escapes cannot
- * be aliased. Same arithmetic, same bytes.
+ * Keep the scalar controls local and read the curves directly on cache misses.
  */
 static void grade_row(se_look_run *r, const uint8_t *src, uint8_t *dst,
                       int w)
@@ -621,20 +647,35 @@ static void grade_row(se_look_run *r, const uint8_t *src, uint8_t *dst,
         return;
     }
     {
-        const se_look lk = r->lk;
+        const se_look *lk = &r->lk;
+        const int hue_any = lk->hue_any, sat = lk->sat;
+        unsigned misses = 0;
         const int16_t (*hue_mod)[3] = r->hue_mod;
+        const unsigned memo_shift = r->memo_shift;
+        const int split = lk->sh[0] | lk->sh[1] | lk->sh[2] |
+                          lk->hi[0] | lk->hi[1] | lk->hi[2];
+        const int (*delta)[3] = split ? r->split_delta : 0;
         for (x = 0; x < w; x++, src += 3, dst += 3) {
             /* read the whole key first: src may be dst */
             uint32_t k = (uint32_t)src[0] | (uint32_t)src[1] << 8 | (uint32_t)src[2] << 16;
-            uint8_t *m = r->memo[LOOK_MEMO_HASH(k)].px;
-            if (r->memo[LOOK_MEMO_HASH(k)].key == k) {
-                dst[0] = m[0]; dst[1] = m[1]; dst[2] = m[2];
-                continue;
+            look_memo_entry *m = &r->memo[(k * 2654435761u) >> memo_shift];
+            uint32_t rgb;
+            if (m->key == k) {
+                rgb = m->rgb;
+            } else {
+                misses++;
+                rgb = grade_px(hue_any, sat, hue_mod, lk->map[0][src[0]],
+                               lk->map[1][src[1]], lk->map[2][src[2]], delta);
+                m->key = k;
+                m->rgb = rgb;
             }
-            grade_px(&lk, hue_mod, lk.map[0][src[0]], lk.map[1][src[1]],
-                     lk.map[2][src[2]], dst);
-            r->memo[LOOK_MEMO_HASH(k)].key = k;
-            m[0] = dst[0]; m[1] = dst[1]; m[2] = dst[2];
+            dst[0] = (uint8_t)rgb;
+            dst[1] = (uint8_t)(rgb >> 8);
+            dst[2] = (uint8_t)(rgb >> 16);
+        }
+        if (r->timing) {
+            r->timing->cache_hits += (unsigned)w - misses;
+            r->timing->cache_misses += misses;
         }
     }
 }
@@ -648,23 +689,47 @@ static void grade_row(se_look_run *r, const uint8_t *src, uint8_t *dst,
  * a soft knee would be prettier, but this is what a threshold means and it
  * is one comparison.
  */
-static void mask_row(const se_look_run *r, const uint8_t *row, int w,
-                     uint8_t *scratch, uint8_t *dst)
+static void mask_row(se_look_run *r, const uint8_t *row, uint8_t *dst, int slot)
 {
-    int x, rad = r->lk.hal_radius, win = 2 * rad + 1;
+    int x, w = r->w, rad = r->r, win = r->nring;
     long sum = 0;
     uint32_t mwin = rdiv_m((uint32_t)win);
     const uint8_t *mask = r->mask;     /* per luma, from se_look_begin */
+    uint8_t *scratch = r->scratch;
+    int *colsum = r->colsum;
 
-    for (x = 0; x < w; x++, row += 3)
-        scratch[x] = mask[luma8(row[0], row[1], row[2])];
+    if (r->skip_empty_halation) {
+        int mask_bits = 0, previous = r->mask_present[slot];
+        for (x = 0; x < w; x++, row += 3) {
+            uint8_t v = mask[luma8(row[0], row[1], row[2])];
+            scratch[x] = v;
+            mask_bits |= v;
+        }
+        r->mask_present[slot] = mask_bits != 0;
+        r->lit_rows += r->mask_present[slot] - previous;
+        if (!mask_bits) {
+            if (previous)
+                for (x = 0; x < w; x++) {
+                    colsum[x] -= dst[x];
+                    dst[x] = 0;
+                }
+            return;
+        }
+    } else {
+        for (x = 0; x < w; x++, row += 3)
+            scratch[x] = mask[luma8(row[0], row[1], row[2])];
+    }
 
     /* prime the window with the left edge clamped */
     for (x = -rad; x <= rad; x++)
         sum += scratch[x < 0 ? 0 : (x >= w ? w - 1 : x)];
     for (x = 0; x < w; x++) {
         int add = x + rad + 1, sub = x - rad;
-        dst[x] = (uint8_t)rdiv((uint32_t)sum, mwin);
+        int next = (int)rdiv((uint32_t)sum, mwin);
+        /* The mask ring starts at zero. Replace the outgoing sample's
+         * contribution as we store the new one. */
+        colsum[x] += next - dst[x];
+        dst[x] = (uint8_t)next;
         sum += scratch[add >= w ? w - 1 : add];
         sum -= scratch[sub < 0 ? 0 : sub];
     }
@@ -751,11 +816,25 @@ static void grain_row(const se_look_run *r, uint8_t *row, int w, int y)
 #undef GRAIN_CELL
 }
 
+void se_look_set_timing(se_look_run *run, se_look_timing *timing)
+{
+    run->timing = timing && timing->clock_ms ? timing : 0;
+}
+
+static unsigned look_now(const se_look_timing *timing)
+{
+    return timing ? (unsigned)timing->clock_ms() : 0;
+}
+
 /* One row, fully graded and already in `dst`, ready to go out. */
 static se_err emit_one(se_look_run *r, uint8_t *dst,
                        se_look_emit emit, void *ctx)
 {
-    if (r->lk.grain > 0) grain_row(r, dst, r->w, r->y_out);
+    if (r->lk.grain > 0) {
+        unsigned start = look_now(r->timing);
+        grain_row(r, dst, r->w, r->y_out);
+        if (r->timing) r->timing->grain_ms += look_now(r->timing) - start;
+    }
     r->y_out++;
     return emit(ctx, dst, r->w) == 0 ? SE_OK : SE_E_IO;
 }
@@ -793,18 +872,18 @@ static se_err push_row(se_look_run *r, const uint8_t *src,
     int      dslot = r->pushed % r->ndelay;
     uint8_t *dly  = r->delay + (size_t)dslot * w * 3;
     uint8_t *msk  = r->ring  + (size_t)slot * w;
-    int      x, p;
-
-    /* The row leaving the window stops contributing to the column sums.
-     * Only once the ring has been round at least once, or we would be
-     * subtracting the zeros se_look_begin put there. */
-    if (r->pushed >= r->nring)
-        for (x = 0; x < w; x++) r->colsum[x] -= msk[x];
+    se_look_timing *timing = r->timing;
+    unsigned start = look_now(timing);
+    int      p;
 
     grade_row(r, src, dly, w);
-    mask_row(r, dly, w, r->scratch, msk);
-
-    for (x = 0; x < w; x++) r->colsum[x] += msk[x];
+    if (timing) {
+        unsigned now = look_now(timing);
+        timing->grade_ms += now - start;
+        start = now;
+    }
+    mask_row(r, dly, msk, slot);
+    if (timing) timing->mask_ms += look_now(timing) - start;
 
     p = r->pushed++;
     if (p < 2 * r->r) return SE_OK;          /* window not centred yet */
@@ -818,7 +897,11 @@ static se_err emit_delayed(se_look_run *r, int p,
     int      slot = (p - r->r) % r->ndelay;
     uint8_t *dly  = r->delay + (size_t)slot * r->w * 3;
 
-    add_glow(r, dly, r->w, r->colsum, r->nring);
+    if (!r->skip_empty_halation || r->lit_rows) {
+        unsigned start = look_now(r->timing);
+        add_glow(r, dly, r->w, r->colsum, r->nring);
+        if (r->timing) r->timing->glow_ms += look_now(r->timing) - start;
+    }
     return emit_one(r, dly, emit, ctx);
 }
 
@@ -837,7 +920,9 @@ se_err se_look_rows(se_look_run *r, const uint8_t *rgb, int nrows,
             /* No halation, so no neighbourhood and no delay: grade and go.
              * The caller's rows are const and may be the decoder's own
              * scratch, so the grade lands in our row, never in theirs. */
+            unsigned start = look_now(r->timing);
             grade_row(r, src, r->flat, r->w);
+            if (r->timing) r->timing->grade_ms += look_now(r->timing) - start;
             e = emit_one(r, r->flat, emit, ctx);
             if (e != SE_OK) return e;
             continue;
@@ -875,14 +960,23 @@ se_err se_look_end(se_look_run *r, se_look_emit emit, void *ctx)
      * that again would feed the glow back through itself. */
     for (k = 0; k < r->r; k++) {
         int slot, x;
+        const uint8_t *prev;
+        uint8_t *next;
+        unsigned start = look_now(r->timing);
         last = (r->pushed - 1) % r->nring;
         slot = r->pushed % r->nring;
 
-        if (r->pushed >= r->nring)
-            for (x = 0; x < w; x++) r->colsum[x] -= r->ring[(size_t)slot * w + x];
-        memcpy(r->ring + (size_t)slot * w,
-                  r->ring + (size_t)last * w, (size_t)w);
-        for (x = 0; x < w; x++) r->colsum[x] += r->ring[(size_t)slot * w + x];
+        prev = r->ring + (size_t)last * w;
+        next = r->ring + (size_t)slot * w;
+        for (x = 0; x < w; x++) {
+            r->colsum[x] += prev[x] - next[x];
+            next[x] = prev[x];
+        }
+        if (r->skip_empty_halation) {
+            r->lit_rows += r->mask_present[last] - r->mask_present[slot];
+            r->mask_present[slot] = r->mask_present[last];
+        }
+        if (r->timing) r->timing->mask_ms += look_now(r->timing) - start;
 
         r->pushed++;
         if (r->pushed - 1 < 2 * r->r) continue;

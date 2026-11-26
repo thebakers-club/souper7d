@@ -74,6 +74,10 @@ enum {M_ONE, M_INPLACE, M_NEW, M_NEWDEL, M_MLSOUP, M_COUNT};
 static int set_mode=M_ONE;
 static int set_auto=0;         /* develop each new shot in the background */
 static int set_lastn=2;        /* index into lastn_choices: 5 */
+enum { HALATION_STOCK, HALATION_SKIP_EMPTY, HALATION_OFF, HALATION_COUNT };
+typedef struct { int halation, grain, cache; } render_settings;
+static render_settings set_render = { HALATION_STOCK, 1, SE_LOOK_CACHE_4K };
+static render_settings job_render;
 static int job_scale=2, job_mode=M_ONE;
 /* derived from job_mode for the new-file modes */
 static int job_delete=0;       /* NEW FILE + DELETE RAW */
@@ -210,6 +214,9 @@ static void load_cfg(void)
         if(!strncmp(t+i,"mode=",5)&&t[i+5]>='0'&&t[i+5]<'0'+M_COUNT)set_mode=t[i+5]-'0';
         if(!strncmp(t+i,"auto=",5)&&(t[i+5]=='0'||t[i+5]=='1'))set_auto=t[i+5]-'0';
         if(!strncmp(t+i,"lastn=",6)&&t[i+6]>='0'&&t[i+6]<='4')set_lastn=t[i+6]-'0';
+        if(!strncmp(t+i,"halation=",9)&&t[i+9]>='0'&&t[i+9]<'0'+HALATION_COUNT)set_render.halation=t[i+9]-'0';
+        if(!strncmp(t+i,"grain=",6)&&(t[i+6]=='0'||t[i+6]=='1'))set_render.grain=t[i+6]-'0';
+        if(!strncmp(t+i,"cache=",6)&&t[i+6]>='0'&&t[i+6]<'0'+SE_LOOK_CACHE_COUNT)set_render.cache=t[i+6]-'0';
         if(!strncmp(t+i,"film=",5)){
             char nm[16];int j=0;
             for(k=i+5;j<15&&t[k]&&t[k]!='\r'&&t[k]!='\n';k++)nm[j++]=t[k];
@@ -243,7 +250,9 @@ static void save_cfg(void)
 {
     char t[640];int i,n;
     /* lengths by strlen: Canon's snprintf is not trusted beyond the text */
-    snprintf(t,sizeof(t),"res=%d\r\nmode=%d\r\nauto=%d\r\nlastn=%d\r\nfilm=%s\r\nfav=",set_res,set_mode,set_auto,set_lastn,
+    snprintf(t,sizeof(t),
+        "res=%d\r\nmode=%d\r\nauto=%d\r\nlastn=%d\r\nhalation=%d\r\ngrain=%d\r\ncache=%d\r\nfilm=%s\r\nfav=",
+        set_res,set_mode,set_auto,set_lastn,set_render.halation,set_render.grain,set_render.cache,
         stock_count&&selected_stock<stock_count?stock_paths[selected_stock]+8:"");
     for(i=0;i<stock_count;i++){
         n=strlen(t);
@@ -263,9 +272,9 @@ static void save_cfg(void)
  *
  * Outputs: SOUP####.JPG with the NEXT FREE number, because Canon playback
  * hides a JPG that shares its number with another image (DCF: one number,
- * one image). The source frame is in the output's EXIF Software tag as
- * "#nnnn". Older outputs (SOUP/SOU2..SOU9 with the source's own number and
- * no "#") still count, by their number. Canon only learns about our numbers
+ * one image). EXIF Software records the source folder and frame. Older outputs
+ * with a bare "#nnnn" or no source tag count only in their own DCIM folder.
+ * Canon only learns about our numbers
  * at its next boot, so it may reuse one for a shot meanwhile; the scan then
  * renames OUR file to a free number. Camera files are never renamed.
  *
@@ -301,6 +310,41 @@ static void frames_release(void)
 static char frames_dir[64];
 
 static char up_ascii(char c){return (c>='a'&&c<='z')?(char)(c-32):c;}
+
+static int dcim_folder_number(const char *folder)
+{
+    int i, number = 0;
+    if (strlen(folder) != 8) return -1;
+    for (i = 0; i < 3; i++) {
+        if (folder[i] < '0' || folder[i] > '9') return -1;
+        number = number * 10 + folder[i] - '0';
+    }
+    return number >= 100 ? number : -1;
+}
+
+/* Six hex digits hold all DCF folder/frame pairs. The folder name and
+ * four-character file prefix distinguish renamed folders and custom prefixes. */
+static void format_source_tag(char *tag, int cap, const char *stock, const char prefix[4], int num)
+{
+    const char *slash = strrchr(frames_dir, '/');
+    const char *folder = slash ? slash + 1 : frames_dir;
+    int number = dcim_folder_number(folder);
+    static const char hex[] = "0123456789ABCDEF";
+    char id[7], name[5];
+    int i, code;
+
+    if (number < 0) {
+        snprintf(tag, cap, "SOUP ENGINE - %s #%04d", stock, num);
+        return;
+    }
+    code = number * 10000 + num;
+    for (i = 0; i < 6; i++) id[i] = hex[(code >> (20 - 4 * i)) & 15];
+    id[6] = 0;
+    memcpy(name, prefix, 4);
+    name[4] = 0;
+    snprintf(tag, cap, "SOUP ENGINE @%s/%s/%s - %s #%04d", id, folder, name, stock, num);
+}
+
 static int parse_dcim_name(const char *n,int *num,char ext[4])
 {
     int i,v=0;
@@ -368,28 +412,61 @@ static void out_path(const out_ent *o,int num,char *out,int cap,const char *ext)
     if(o->ver<=1)snprintf(out,cap,"%s/SOUP%04d.%s",o->in_ml?"ML/SOUP":frames_dir,num,ext);
     else snprintf(out,cap,"%s/SOU%d%04d.%s",o->in_ml?"ML/SOUP":frames_dir,o->ver,num,ext);
 }
-/* Source frame recorded in an output's EXIF ("SOUP ENGINE - <stock> #nnnn"),
- * or -1 for an older output without one. Only the first 1 KB is read. */
-static int read_src(const char *path,uint8_t *buf,int cap)
+enum { SRC_INVALID = -1, SRC_UNTAGGED, SRC_LEGACY, SRC_QUALIFIED };
+typedef struct { int num; char folder[9]; char prefix[4]; } source_ref;
+
+static int parse_source_id(const uint8_t *s, int len, source_ref *ref)
 {
-    FILE *f;uint32_t size=0,n;int i,v;
-    if(FIO_GetFileSize(path,&size)!=0||size<64)return -1;
+    int code = 0, i, folder;
+    if (len < 22 || s[7] != '/' || s[16] != '/' || s[21] != ' ') return SRC_INVALID;
+    for (i = 1; i <= 6; i++) {
+        char c = up_ascii(s[i]);
+        if (c >= '0' && c <= '9') code = code * 16 + c - '0';
+        else if (c >= 'A' && c <= 'F') code = code * 16 + c - 'A' + 10;
+        else return SRC_INVALID;
+    }
+    memcpy(ref->folder, s + 8, 8);
+    ref->folder[8] = 0;
+    folder = dcim_folder_number(ref->folder);
+    ref->num = code % 10000;
+    if (folder < 0 || folder != code / 10000 || ref->num == 0) return SRC_INVALID;
+    memcpy(ref->prefix, s + 17, 4);
+    return SRC_QUALIFIED;
+}
+
+/* EXIF Software is close to the start of files written by our encoder. */
+static int read_src(const char *path,uint8_t *buf,int cap, source_ref *ref)
+{
+    FILE *f;uint32_t size=0,n;int i;
+    if(FIO_GetFileSize(path,&size)!=0||size<64)return SRC_INVALID;
     n=size<(uint32_t)cap?size:(uint32_t)cap;
-    f=FIO_OpenFile(path,O_RDONLY);if(!good_file(f))return -1;
-    if(read_exact(f,0,buf,n)!=0){FIO_CloseFile(f);return -1;}
+    f=FIO_OpenFile(path,O_RDONLY);if(!good_file(f))return SRC_INVALID;
+    if(read_exact(f,0,buf,n)!=0){FIO_CloseFile(f);return SRC_INVALID;}
     FIO_CloseFile(f);
     for(i=0;i+11<(int)n;i++){
+        int end;
         if(memcmp(buf+i,"SOUP ENGINE",11))continue;
-        for(;i+5<(int)n&&buf[i];i++){
+        end=i+11;
+        while(end<(int)n&&buf[end])end++;
+        if(end>i+12&&buf[i+11]==' '&&buf[i+12]=='@')
+            return parse_source_id(buf+i+12,end-i-12,ref);
+        for(i+=11;i+4<end;i++){
             if(buf[i]=='#'&&buf[i+1]>='0'&&buf[i+1]<='9'&&buf[i+2]>='0'&&buf[i+2]<='9'&&
                buf[i+3]>='0'&&buf[i+3]<='9'&&buf[i+4]>='0'&&buf[i+4]<='9'){
-                v=(buf[i+1]-'0')*1000+(buf[i+2]-'0')*100+(buf[i+3]-'0')*10+(buf[i+4]-'0');
-                return v>=1?v:-1;
+                ref->num=(buf[i+1]-'0')*1000+(buf[i+2]-'0')*100+(buf[i+3]-'0')*10+(buf[i+4]-'0');
+                return ref->num>=1?SRC_LEGACY:SRC_INVALID;
             }
         }
-        return -1;
+        break;
     }
-    return -1;
+    return SRC_UNTAGGED;
+}
+
+static int same_name(const char *a, const char *b, int len)
+{
+    int i;
+    for (i = 0; i < len; i++) if (up_ascii(a[i]) != up_ascii(b[i])) return 0;
+    return 1;
 }
 /* 1 if the file's first `cap` bytes carry our EXIF Software tag. */
 static int soup_marked(const char *path,uint8_t *buf,int cap)
@@ -433,30 +510,43 @@ static int next_output(int in_ml,char *out,char *tmp,int cap)
 /* Rebuild the index for the current shooting folder. Never while a job runs. */
 static int index_build(void)
 {
-    int i,j,at,src;uint8_t *buf;char p[96],q[96],tq[96];
+    int i,j,at;uint8_t *buf;char p[96],q[96],tq[96];
+    const char *folder;
     if(!frames){
         frames=malloc(MAX_FRAMES*sizeof(frame_ent)+MAX_OUTS*sizeof(out_ent));if(!frames)return -1;
         outs=(out_ent*)(frames+MAX_FRAMES);
     }
     nframes=0;frames_overflow=0;nouts=0;max_cam=0;max_ml=0;
     snprintf(frames_dir,sizeof(frames_dir),"%s",get_dcim_dir());
+    folder=strrchr(frames_dir,'/');
+    folder=folder?folder+1:frames_dir;
     if(scan_dir(frames_dir,0)!=0)return -1;
     scan_dir("ML/SOUP",1);             /* outputs kept there count as developed */
     buf=fio_malloc(1024);
     for(i=0;i<nouts;i++){
         out_ent *o=&outs[i];
+        source_ref ref;
+        int kind, source_at=-1;
+        if(!buf)break;
         out_path(o,o->num,p,sizeof(p),"JPG");
-        src=buf?read_src(p,buf,1024):-1;
-        if(src<0)src=o->num;           /* older output: its own number is the source */
+        kind=read_src(p,buf,1024,&ref);
+        if(kind==SRC_QUALIFIED&&strlen(folder)==8&&same_name(folder,ref.folder,8)){
+            at=frame_lookup(ref.num);
+            if(at>=0&&(((frames[at].flags&F_CR2)&&same_name(frames[at].cr2p,ref.prefix,4))||
+                       ((frames[at].flags&F_JPG)&&same_name(frames[at].jpgp,ref.prefix,4))))source_at=at;
+        }else if(!o->in_ml&&(kind==SRC_LEGACY||kind==SRC_UNTAGGED)){
+            source_at=frame_lookup(kind==SRC_LEGACY?ref.num:o->num);
+        }
         /* Canon reused our number for a real shot: move OUR file out of the way */
-        if(!o->in_ml&&src!=o->num&&(at=frame_lookup(o->num))>=0&&(frames[at].flags&(F_CR2|F_JPG))){
+        if(!o->in_ml&&(kind==SRC_QUALIFIED||(kind==SRC_LEGACY&&ref.num!=o->num))&&
+           (at=frame_lookup(o->num))>=0&&at!=source_at&&(frames[at].flags&(F_CR2|F_JPG))){
             int nn=next_output(0,q,tq,sizeof(q));
             if(nn>0){
                 out_ent t=*o;t.ver=1;out_path(&t,nn,q,sizeof(q),"JPG");
                 if(FIO_RenameFile(p,q)==0){char d_[224];snprintf(d_,sizeof(d_),"renamed %s -> %s (camera reused the number)",p,q);diag(d_);diag_flush();o->num=(uint16_t)nn;o->ver=1;}
             }
         }
-        if((at=frame_lookup(src))>=0)frames[at].done=1;
+        if(source_at>=0)frames[source_at].done=1;
     }
     /* Interrupted in-place swaps: the TMP is the develop, the JPG is gone.
      * Finish the rename -- only for a complete JPEG; a cut-off one is a
@@ -668,9 +758,11 @@ static int job_total;
 static volatile int job_pos;
 static int job_ok, job_failed, job_skipped, job_deleted, job_kept;
 static int job_out;                    /* NEW FILE modes: 0 camera folder, 1 ML/SOUP */
-static int auto_base=-1, auto_upto;    /* auto develop: frames after auto_base, up to auto_upto */
+static int auto_base=-1, auto_upto, auto_upto_folder;
 static int lv_ago=99;                  /* seconds since Live View was last on */
 static const char *const mode_names[M_COUNT]={"JPEG ONLY","REPLACE JPEG","NEW JPEG","NEW JPEG + DELETE RAW","ML/SOUP FOLDER"};
+static const char *const halation_names[HALATION_COUNT]={"STOCK","SKIP EMPTY","OFF"};
+static const char *const cache_names[SE_LOOK_CACHE_COUNT]={"4K","8K","16K"};
 static char last_out[96], last_from[4];
 static char job_log[2048]; static int job_log_len;
 
@@ -736,7 +828,39 @@ static int mem_sink(void *ctx,const uint8_t *d,size_t n)
     if(n>m->cap-m->len)return -1;
     memcpy(m->buf+m->len,d,n);m->len+=n;return 0;
 }
-typedef struct {se_jpeg *enc;se_look_run *look;int width;} pipeline;
+/* Set to 1 for per-batch JPEG timing; the outer encode timer runs in both builds. */
+enum { JPEG_DETAIL_TIMING = 0 };
+enum {
+    STREAM_DECODE, STREAM_LOOK, STREAM_ENCODE, STREAM_READ, STREAM_WRITE,
+    STREAM_YIELD, STREAM_JPEG_COLOR, STREAM_JPEG_TRANSFORM, STREAM_JPEG_ENTROPY,
+    STREAM_PHASE_COUNT
+};
+
+typedef struct {
+    unsigned ms[STREAM_PHASE_COUNT];
+    unsigned since;
+    int phase;
+} stream_timing;
+
+/* One active phase at a time, even during nested encoder and card calls. */
+static void stream_mark_at(stream_timing *timing, int phase, unsigned now)
+{
+    timing->ms[timing->phase] += now - timing->since;
+    timing->since = now;
+    timing->phase = phase;
+}
+
+static void stream_mark(stream_timing *timing, int phase)
+{
+    stream_mark_at(timing, phase, (unsigned)get_ms_clock());
+}
+
+typedef struct {
+    se_jpeg *enc;
+    se_look_run *look;
+    int width;
+    stream_timing *timing;
+} pipeline;
 static int th_emit(void *ctx,const uint8_t *row,int width)
 {
     pipeline *p=ctx;
@@ -749,22 +873,30 @@ static int th_rows(void *ctx,const uint8_t *rgb,int rows,int width)
     if(JOB_STOP()||width!=p->width)return -1;
     return se_look_rows(p->look,rgb,rows,th_emit,p)==SE_OK?0:-1;
 }
+static void job_look_from_stock(const se_stock *stock, int scale, se_look *look)
+{
+    se_look_from_stock(stock,scale,look);
+    if(job_render.halation==HALATION_OFF)look->hal_amount=0;
+    if(!job_render.grain)look->grain=0;
+}
+
 static int graded_thumb(const se_stock *stock,const uint8_t *jpg,uint32_t len,uint8_t *out,int src_width)
 {
     se_arena a,la;se_jdec_info ji;se_look lk;pipeline p;membuf mb;uint8_t *mem,*strip;
     size_t ls;int result=0;
     if(!jpg||len<64)return 0;
-    mem=tmp_malloc(160*1024);if(!mem)return 0;
     memset(&p,0,sizeof(p));
-    se_arena_init(&a,mem,96*1024);
-    if(se_jpeg_dec_info(jpg,len,&ji)!=SE_OK||ji.width>THUMB_W||ji.width<16)goto out;
+    if(se_jpeg_dec_info(jpg,len,&ji)!=SE_OK||ji.width>THUMB_W||ji.width<16)return 0;
     /* grain and halation are scaled to the thumbnail's size, not the frame's */
     (void)src_width;
-    se_look_from_stock(stock,4,&lk);   /* coarsest supported scale: grain and glow stay small */
+    job_look_from_stock(stock,4,&lk);   /* coarsest supported scale: grain and glow stay small */
     ls=se_look_fit(&lk,ji.width,60*1024);
-    se_arena_init(&la,mem+96*1024,ls<64*1024?ls:64*1024);
+    mem=tmp_malloc(96*1024+ls);if(!mem)return 0;
+    se_arena_init(&a,mem,96*1024);
+    se_arena_init(&la,mem+96*1024,ls);
     p.enc=SE_NEW(&a,se_jpeg,1);strip=SE_NEW(&a,uint8_t,(size_t)8*ji.width*3);p.width=ji.width;
-    if(!p.enc||!strip||se_look_begin(&p.look,&lk,ji.width,&la)!=SE_OK)goto out;
+    if(!p.enc||!strip||se_look_begin_with_options(&p.look,&lk,ji.width,&la,SE_LOOK_CACHE_4K,
+                                               job_render.halation==HALATION_SKIP_EMPTY)!=SE_OK)goto out;
     mb.buf=out;mb.len=0;mb.cap=TH_CAP;
     if(se_jpeg_begin(p.enc,ji.width,ji.height,75,strip,0,mem_sink,&mb)!=SE_OK)goto out;
     if(se_jpeg_decode_scaled(jpg,len,1,&a,th_rows,&p,&ji)!=SE_OK)goto out;
@@ -774,24 +906,74 @@ out:
     free(mem);return result;
 }
 
-typedef struct {FILE *f;uint32_t base,total;void *dma;} reader;
+typedef struct {
+    FILE *f;
+    uint32_t base,total,next,header_len,card_bytes,seeks;
+    const uint8_t *header;
+    void *dma;
+    stream_timing *timing;
+} reader;
 static int preview_read(void *ctx,uint32_t off,void *dst,uint32_t n)
 {
     reader *r=ctx;
-    if(JOB_STOP()||n>IO_CAP||off>r->total||n>r->total-off)return -1;
-    if(read_exact(r->f,r->base+off,r->dma,n)!=0)return -1;
-    progress_pct=(int)((uint64_t)(off+n)*100u/r->total);
-    memcpy(dst,r->dma,n);return 0;
+    uint32_t end=off+n, cached=0, done=0;
+    if(JOB_STOP()||!r->total||n>IO_CAP||off>r->total||n>r->total-off)return -1;
+    if(off<r->header_len){
+        cached=SE_MIN(n,r->header_len-off);
+        memcpy(dst,r->header+off,cached);
+    }
+    if(cached<n){
+        uint32_t pos=r->base+off+cached, rest=n-cached;
+        /* JPEG reads forward. Keep the file cursor between decoder refills. */
+        stream_mark(r->timing,STREAM_READ);
+        if(pos!=r->next){
+            if(FIO_SeekSkipFile(r->f,pos,SEEK_SET)!=pos)return -1;
+            r->next=pos;r->seeks++;
+        }
+        while(done<rest){
+            int got=FIO_ReadFile(r->f,(uint8_t*)r->dma+done,rest-done);
+            if(got<=0||(uint32_t)got>rest-done)return -1;
+            done+=(uint32_t)got;
+            r->next+=(uint32_t)got;
+        }
+        stream_mark(r->timing,STREAM_DECODE);
+        r->card_bytes+=rest;
+        memcpy((uint8_t*)dst+cached,r->dma,rest);
+    }
+    /* MAX_PREVIEW is 32 MiB, so the product fits in 32 bits. */
+    progress_pct=(int)(end*100u/r->total);
+    return 0;
 }
-typedef struct {FILE *f;void *dma;uint32_t used,total;int error;} writer;
+typedef struct {
+    FILE *f;
+    void *dma;
+    uint32_t used,total;
+    int error;
+    stream_timing *timing;
+} writer;
+
+static void jpeg_mark_phase(void *ctx,se_jpeg_phase phase)
+{
+    static const int phases[]={
+        [SE_JPEG_COLOR]=STREAM_JPEG_COLOR, [SE_JPEG_TRANSFORM]=STREAM_JPEG_TRANSFORM,
+        [SE_JPEG_ENTROPY]=STREAM_JPEG_ENTROPY, [SE_JPEG_OTHER]=STREAM_ENCODE
+    };
+    writer *w=ctx;
+    stream_mark(w->timing,phases[phase]);
+}
+
 static int flush_output(writer *w)
 {
     uint32_t done=0;
+    if(!w->used)return 0;
+    int parent=w->timing->phase;
+    stream_mark(w->timing,STREAM_WRITE);
     while(done<w->used){
         int n=FIO_WriteFile(w->f,(uint8_t*)w->dma+done,w->used-done);
         if(n<=0||(uint32_t)n>w->used-done){w->error=1;return -1;}
         done+=(uint32_t)n;
     }
+    stream_mark(w->timing,parent);
     w->total+=w->used;w->used=0;return 0;
 }
 static int jpeg_sink(void *ctx,const uint8_t *data,size_t len)
@@ -809,21 +991,37 @@ static int jpeg_sink(void *ctx,const uint8_t *data,size_t len)
 static int emit_row(void *ctx,const uint8_t *row,int width)
 {
     pipeline *p=ctx;
+    int rc;
     if(JOB_STOP()||width!=p->width)return -1;
-    return se_jpeg_write_rows(p->enc,row,1)==SE_OK?0:-1;
+    /* Only the eighth row runs the encoder. The other calls just queue RGB. */
+    if(p->enc->strip_rows!=7)return se_jpeg_write_rows(p->enc,row,1)==SE_OK?0:-1;
+    stream_mark(p->timing,STREAM_ENCODE);
+    rc=se_jpeg_write_rows(p->enc,row,1);
+    stream_mark(p->timing,STREAM_LOOK);
+    return rc==SE_OK?0:-1;
 }
 static int grade_rows(void *ctx,const uint8_t *rgb,int rows,int width)
 {
     pipeline *p=ctx;
-    static int last_yield;
-    int t0=get_ms_clock();
+    static unsigned last_yield;
+    unsigned now;
+    int rc;
     if(JOB_STOP()||width!=p->width)return -1;
     /* Yield so Canon's lower-priority tasks keep running (the GUI task
      * outranks this one and preempts it anyway). msleep(1) costs a whole
      * 10 ms DryOS tick: once per MCU row was 2.3 s a frame, so only after
      * ~500 ms of work. */
-    if(t0-last_yield>=500){msleep(1);last_yield=get_ms_clock();}
-    return se_look_rows(p->look,rgb,rows,emit_row,p)==SE_OK?0:-1;
+    now=(unsigned)get_ms_clock();
+    if(now-last_yield>=500){
+        stream_mark_at(p->timing,STREAM_YIELD,now);
+        msleep(1);
+        now=(unsigned)get_ms_clock();
+        last_yield=now;
+    }
+    stream_mark_at(p->timing,STREAM_LOOK,now);
+    rc=se_look_rows(p->look,rgb,rows,emit_row,p);
+    stream_mark(p->timing,STREAM_DECODE);
+    return rc==SE_OK?0:-1;
 }
 
 /* Our EXIF Software tag sits in the first few hundred bytes of a JPG. */
@@ -844,10 +1042,16 @@ static int develop_frame(int num,const se_stock *stock,char *text_scratch)
     int inplace=job_mode<=M_INPLACE,jpg_soup=0,skipped=0,keep_temp=0;
     se_err rc=SE_E_IO;se_look look;se_jpeg_exif ex;meta_info meta;
     se_arena arena,look_arena;pipeline pipe;source_info src,alt;
-    reader rd;writer wr;size_t look_size;uint8_t *strip,*thumb=0;
-    frame_ent *e;char cr2_path[96],jpg_path[96],input_path[96],output_path[96],temp_path[96],sw[64];
+    reader rd={0};writer wr;size_t look_size;uint8_t *strip,*thumb=0;
+    frame_ent *e;char cr2_path[96],jpg_path[96],input_path[96],output_path[96],temp_path[96],sw[96];
     const char *why="failed";
     int t_start=get_ms_clock();
+    unsigned phase_start,probe_ms,thumb_ms,stream_ms,commit_ms;
+    unsigned stream_start;
+    stream_timing timing={0};
+    se_look_timing look_timing={.clock_ms=get_ms_clock};
+    int cache=job_render.cache;
+    size_t look_extra;
     memset(&pipe,0,sizeof(pipe));memset(&wr,0,sizeof(wr));memset(&src,0,sizeof(src));memset(&ex,0,sizeof(ex));
     memset(&meta,0,sizeof(meta));input_path[0]=0;
     at=frame_lookup(num);
@@ -877,44 +1081,71 @@ static int develop_frame(int num,const se_stock *stock,char *text_scratch)
         scale=job_scale;
         /* never grade our own output a second time */
         if(jpg_soup&&!have_cr2){why="already developed";skipped=1;goto done;}
-        if(have_cr2&&probe_source(cr2_path,1,header,&src,&got)==0)
-            snprintf(input_path,sizeof(input_path),"%s",cr2_path);
-        else{why="unreadable";goto done;}
+        if(!have_cr2){why="unreadable";goto done;}
+        if(e->flags&F_JPG){
+            if(probe_source(cr2_path,1,header,&src,&got)!=0){why="unreadable";goto done;}
+        }else src=alt;  /* RAW-only: our first probe is still in the header buffer */
+        snprintf(input_path,sizeof(input_path),"%s",cr2_path);
     }
     read_meta(header,got,src.is_cr2,&meta);
+    phase_start=(unsigned)get_ms_clock();
+    probe_ms=phase_start-(unsigned)t_start;
     /* graded EXIF thumbnail, from the header already in memory */
     thumb=malloc(TH_CAP);
     if(thumb&&meta.thumb_len)thumb_len=graded_thumb(stock,(uint8_t*)header+meta.thumb_off,meta.thumb_len,thumb,src.ji.width);
-    snprintf(sw,sizeof(sw),"SOUP ENGINE - %s #%04d",stock_names[job_stock],num);
+    format_source_tag(sw,sizeof(sw),stock_names[job_stock],src.is_cr2?e->cr2p:e->jpgp,num);
     ex.make=meta.make[0]?meta.make:"Canon";ex.model=meta.model[0]?meta.model:"Canon EOS 7D";
     ex.software=sw;ex.datetime=meta.date[0]?meta.date:0;
     ex.exposure_time=meta.exposure;ex.aperture=meta.fnumber;ex.iso=meta.iso;ex.orientation=meta.orient;
     ex.thumb=thumb_len>0?thumb:0;ex.thumb_len=thumb_len;
+    thumb_ms=(unsigned)get_ms_clock()-phase_start;
 
     in=FIO_OpenFile(input_path,O_RDONLY);if(!good_file(in)){in=0;goto done;}
     se_jpeg_scaled_size(src.ji.width,src.ji.height,scale,&ow,&oh);
     /* grain and glow are sized against the full frame, not the source */
-    se_look_from_stock(stock,job_scale,&look);
+    job_look_from_stock(stock,job_scale,&look);
     look_size=se_look_fit(&look,ow,SE_LOOK_BUDGET);
-    memory=tmp_malloc(SCRATCH_CAP+look_size+64);read_dma=fio_malloc(IO_CAP);write_dma=fio_malloc(IO_CAP);
+    if(!look.hue_any&&look.sat==0)cache=SE_LOOK_CACHE_4K;
+    for(;;){
+        look_extra=se_look_cache_extra(cache);
+        memory=tmp_malloc(SCRATCH_CAP+look_size+look_extra+64);
+        if(memory||cache==SE_LOOK_CACHE_4K)break;
+        cache--;
+    }
+    read_dma=fio_malloc(IO_CAP);write_dma=fio_malloc(IO_CAP);
     if(!memory||!read_dma||!write_dma){why=!memory?"no mem scratch":!read_dma?"no mem read_dma":"no mem write_dma";goto done;}
     se_arena_init(&arena,memory,SCRATCH_CAP);
-    se_arena_init(&look_arena,(uint8_t*)memory+SCRATCH_CAP,look_size);
+    se_arena_init(&look_arena,(uint8_t*)memory+SCRATCH_CAP,look_size+look_extra);
     pipe.enc=SE_NEW(&arena,se_jpeg,1);pipe.width=ow;
     strip=SE_NEW(&arena,uint8_t,(size_t)8*ow*3);
     if(!pipe.enc||!strip)goto done;
-    if(se_look_begin(&pipe.look,&look,ow,&look_arena)!=SE_OK)goto done;
+    if(se_look_begin_with_options(&pipe.look,&look,ow,&look_arena,cache,
+                                 job_render.halation==HALATION_SKIP_EMPTY)!=SE_OK)goto done;
+    se_look_set_timing(pipe.look,&look_timing);
     if((!inplace&&is_file(output_path))||is_file(temp_path))goto done;
     /* O_EXCL is not assumed supported by Canon's FIO; names are chosen
      * unused and rechecked immediately, and only this task writes them. */
     out=FIO_CreateFile(temp_path);if(!good_file(out)){out=0;why="cannot create output";goto done;}created=1;
-    wr.f=out;wr.dma=write_dma;
-    if(se_jpeg_begin(pipe.enc,ow,oh,88,strip,&ex,jpeg_sink,&wr)!=SE_OK)goto done;
+    wr.f=out;wr.dma=write_dma;wr.timing=&timing;
     rd.f=in;rd.base=src.offset;rd.total=src.length;rd.dma=read_dma;
+    rd.header=(uint8_t*)header+src.offset;rd.header_len=(uint32_t)src.hdr_len;
+    rd.timing=&timing;pipe.timing=&timing;
+    stream_start=(unsigned)get_ms_clock();
+    timing.since=stream_start;
+    timing.phase=STREAM_ENCODE;
+    if(se_jpeg_begin(pipe.enc,ow,oh,88,strip,&ex,jpeg_sink,&wr)!=SE_OK)goto done;
+    if(JPEG_DETAIL_TIMING)pipe.enc->mark_phase=jpeg_mark_phase;
+    stream_mark(&timing,STREAM_DECODE);
     rc=se_jpeg_decode_stream_scaled((uint8_t*)header+src.offset,src.hdr_len,src.length,
         preview_read,&rd,scale,&arena,grade_rows,&pipe,&src.ji);
-    if(rc!=SE_OK||se_look_end(pipe.look,emit_row,&pipe)!=SE_OK)goto done;
+    if(rc!=SE_OK)goto done;
+    stream_mark(&timing,STREAM_LOOK);
+    if(se_look_end(pipe.look,emit_row,&pipe)!=SE_OK)goto done;
+    stream_mark(&timing,STREAM_ENCODE);
     if(se_jpeg_end(pipe.enc)!=SE_OK||flush_output(&wr)!=0||wr.error)goto done;
+    phase_start=(unsigned)get_ms_clock();
+    stream_mark_at(&timing,STREAM_ENCODE,phase_start);
+    stream_ms=phase_start-stream_start;
     FIO_CloseFile(out);out=0;
     FIO_CloseFile(in);in=0;            /* the source may be the file being replaced */
     if(FIO_GetFileSize(temp_path,&check_size)!=0||check_size!=wr.total||!check_size)goto done;
@@ -957,6 +1188,7 @@ done:
     if(memory)free(memory);
     if(thumb)free(thumb);
     if(success){
+        commit_ms=(unsigned)get_ms_clock()-phase_start;
         snprintf(last_out,sizeof(last_out),"%s",output_path);
         snprintf(last_from,sizeof(last_from),"%s",src.is_cr2?"CR2":"JPG");
         e->done=1;(void)version;
@@ -965,6 +1197,37 @@ done:
         num,success?"ok":skipped?"skipped: already developed (no CR2 left)":JOB_STOP()?"cancelled":why,input_path[0]?input_path:"-",
         success?output_path:"-",scale,thumb_len,meta.orient,raw_deleted,get_ms_clock()-t_start);
     log_line(text_scratch);
+    if(success){
+        unsigned look_accounted=look_timing.grade_ms+look_timing.mask_ms+
+                                look_timing.glow_ms+look_timing.grain_ms;
+        unsigned encode_ms=timing.ms[STREAM_ENCODE]+timing.ms[STREAM_JPEG_COLOR]+
+                           timing.ms[STREAM_JPEG_TRANSFORM]+timing.ms[STREAM_JPEG_ENTROPY];
+        /* Canon's snprintf does not handle %u. These counters fit in int. */
+        snprintf(text_scratch,256,"perf %04d probe_ms=%d thumb_ms=%d stream_ms=%d commit_ms=%d seeks=%d stream_read_bytes=%d",
+                 num,(int)probe_ms,(int)thumb_ms,(int)stream_ms,(int)commit_ms,(int)rd.seeks,(int)rd.card_bytes);
+        log_line(text_scratch);
+        snprintf(text_scratch,256,"pipe %04d decode_ms=%d look_ms=%d encode_ms=%d read_ms=%d write_ms=%d yield_ms=%d",
+                 num,(int)timing.ms[STREAM_DECODE],(int)timing.ms[STREAM_LOOK],(int)encode_ms,
+                 (int)timing.ms[STREAM_READ],(int)timing.ms[STREAM_WRITE],(int)timing.ms[STREAM_YIELD]);
+        log_line(text_scratch);
+        if(JPEG_DETAIL_TIMING){
+            snprintf(text_scratch,256,"jpeg %04d color_ms=%d dct_quant_ms=%d entropy_ms=%d other_ms=%d",
+                     num,(int)timing.ms[STREAM_JPEG_COLOR],(int)timing.ms[STREAM_JPEG_TRANSFORM],
+                     (int)timing.ms[STREAM_JPEG_ENTROPY],(int)timing.ms[STREAM_ENCODE]);
+        }else{
+            snprintf(text_scratch,256,"jpeg %04d timing=OFF batch_mcus=%d",num,SE_JPEG_BATCH_MCUS);
+        }
+        log_line(text_scratch);
+        snprintf(text_scratch,256,"look %04d grade_ms=%d mask_ms=%d glow_ms=%d grain_ms=%d other_ms=%d",
+                 num,(int)look_timing.grade_ms,(int)look_timing.mask_ms,(int)look_timing.glow_ms,
+                 (int)look_timing.grain_ms,(int)(timing.ms[STREAM_LOOK]-look_accounted));
+        log_line(text_scratch);
+        snprintf(text_scratch,256,"render %04d halation=%s grain=%s cache_requested=%s cache_used=%s cache_hits=%d cache_misses=%d",
+                 num,halation_names[job_render.halation],job_render.grain?"STOCK":"OFF",
+                 cache_names[job_render.cache],cache_names[cache],
+                 (int)look_timing.cache_hits,(int)look_timing.cache_misses);
+        log_line(text_scratch);
+    }
     return success?1:skipped?0:-1;
 }
 
@@ -972,11 +1235,18 @@ static void job_settings(void)
 {
     job_scale=set_res==0?1:2;job_mode=set_mode;
     job_delete=set_mode==M_NEWDEL;job_out=set_mode==M_MLSOUP;
+    job_render=set_render;
 }
 
-/* Automatic develop: everything shot after auto_base, up to auto_upto, that
- * is not developed yet. Runs in the job task, so the clock callback that
- * starts it never touches the card. 0 = nothing to do. */
+static int ensure_output_dir(void)
+{
+    if(!is_dir("ML/SOUP"))FIO_CreateDirectory("ML/SOUP");
+    return is_dir("ML/SOUP");
+}
+
+/* Queue up to MAX_JOB undeveloped frames after auto_base, up to auto_upto.
+ * Runs in the worker so the clock callback never accesses the card. Returns
+ * 0 for an empty queue or -1 if the card is unavailable and should be retried. */
 static int auto_select(void)
 {
     int i,n=0;
@@ -984,22 +1254,33 @@ static int auto_select(void)
     if(!set_auto||!stock_count)return 0;
     job_stock=selected_stock;if(job_stock<0||job_stock>=stock_count)return 0;
     job_settings();
-    if(index_build()!=0)return 0;
+    if(index_build()!=0)return -1;
+    if(auto_upto_folder>=100){
+        const char *folder=strrchr(frames_dir,'/');
+        if(!folder||dcim_folder_number(folder+1)!=auto_upto_folder)return -1;
+    }
     for(i=0;i<nframes&&n<MAX_JOB;i++){
         frame_ent *e=&frames[i];
         if(e->num>auto_base&&e->num<=auto_upto&&!e->done&&!(e->flags&F_DUP))job_nums[n++]=e->num;
     }
-    return n;
+    return n&&!ensure_output_dir()?-1:n;
 }
 
 static void job_task(void *unused)
 {
-    char text[16384],line[256];se_stock stock;int n,i,r,stopped=0;
+    char text[16384],line[256];se_stock stock;int n,i,r,stopped=0,auto_batch_end=0;
     (void)unused;
     job_log_len=0;job_log[0]=0;
     if(job_auto){
-        job_total=auto_select();
-        if(!job_total){auto_base=auto_upto;if(!gui_task_alive)frames_release();job_auto=0;busy=0;return;}
+        n=auto_select();
+        if(n<=0){
+            if(n==0)auto_base=auto_upto;
+            if(!gui_task_alive)frames_release();
+            job_auto=0;busy=0;return;
+        }
+        job_total=n;
+        /* A full batch may have left more frames for the next clock tick. */
+        auto_batch_end=n==MAX_JOB?job_nums[n-1]:auto_upto;
         /* Show the developing screen, as if Soup had been opened by hand: it
          * closes itself when done, or at once on a half-press. Not over Live
          * View, playback or a menu -- there the end-of-job note is enough.
@@ -1019,7 +1300,7 @@ static void job_task(void *unused)
     se_stock_init(&stock);
     if(n<=0||se_stock_parse(text,(size_t)n,&stock)!=SE_OK){
         snprintf(line,sizeof(line),"stock unreadable: %s rc=%d",stock_paths[job_stock],n);
-        log_line(line);job_failed=job_total;if(job_auto)auto_base=auto_upto;goto out;}
+        log_line(line);job_failed=job_total;if(job_auto)auto_base=auto_batch_end;goto out;}
     for(i=0;i<job_total;i++){
         if(JOB_STOP()){stopped=1;break;}
         job_pos=i;progress_pct=0;
@@ -1031,7 +1312,7 @@ static void job_task(void *unused)
          * are in FIND.TXT); a frame that was stopped is tried again */
         if(job_auto)auto_base=job_nums[i];
     }
-    if(job_auto&&!stopped)auto_base=auto_upto;
+    if(job_auto&&!stopped)auto_base=auto_batch_end;
 out:
     write_small_file(FIND_LOG,job_log);
     diag_flush();
@@ -1056,8 +1337,7 @@ static const char *begin_job(const uint16_t *nums,int count)
     if(!stock_count)return "NO FILM STOCKS";
     if(count<1)return "NO PHOTOS TO DEVELOP";
     if(count>MAX_JOB)count=MAX_JOB;
-    if(!is_dir("ML/SOUP"))FIO_CreateDirectory("ML/SOUP");
-    if(!is_dir("ML/SOUP"))return "CANNOT CREATE ML/SOUP";
+    if(!ensure_output_dir())return "CANNOT CREATE ML/SOUP";
     job_stock=selected_stock;if(job_stock<0||job_stock>=stock_count)return "NO STOCK SELECTED";
     for(i=0;i<count;i++)job_nums[i]=nums[i];
     job_total=count;job_pos=0;job_ok=job_failed=job_skipped=job_deleted=job_kept=0;
@@ -1071,33 +1351,33 @@ static const char *begin_job(const uint16_t *nums,int count)
 
 /*
  * Auto develop, checked once a second from ML's clock task. Cheap and no
- * card I/O: it only watches Canon's file counter. Once a new shot has been
+ * card I/O: it watches Canon's folder and file counters. Once a new shot has been
  * followed by two quiet seconds with the camera idle (capture job finished,
  * shutter not half-pressed, Soup screen closed), the job task is started in
  * auto mode and works out what to develop itself. The first shot after boot
  * also loads the settings; with AUTO off that is all that happens.
  */
-static int auto_seen=-1, auto_quiet;
+static int auto_seen=-1, auto_seen_folder, auto_quiet;
 static unsigned int soup_clock(unsigned int ctx)
 {
     struct card_info *card=get_shooting_card();
-    int fn;
+    int fn,folder;
     (void)ctx;
     if(lv)lv_ago=0;else if(lv_ago<99)lv_ago++;
-    if(!card||stop_worker||ml_shutdown_requested)return CBR_RET_CONTINUE;
-    fn=card->file_number;
-    if(auto_base<0){auto_base=auto_seen=fn;return CBR_RET_CONTINUE;}   /* boot: start from here */
-    if(fn!=auto_seen){
-        if(fn<auto_seen)auto_base=fn-1;   /* numbering restarted (new folder, wiped card) */
-        auto_seen=fn;auto_quiet=0;return CBR_RET_CONTINUE;
+    if(!card||busy||stop_worker||ml_shutdown_requested)return CBR_RET_CONTINUE;
+    fn=card->file_number;folder=card->folder_number;
+    if(auto_seen<0){auto_base=auto_seen=fn;auto_seen_folder=folder;return CBR_RET_CONTINUE;}
+    if(fn!=auto_seen||folder!=auto_seen_folder){
+        if(fn<auto_seen||(folder!=auto_seen_folder&&fn==auto_seen))auto_base=fn-1;
+        auto_seen=fn;auto_seen_folder=folder;auto_quiet=0;return CBR_RET_CONTINUE;
     }
-    if(fn<=auto_base||busy||gui_task_alive)return CBR_RET_CONTINUE;
+    if(fn<1||fn<=auto_base||gui_task_alive)return CBR_RET_CONTINUE;
     if(loaded&&!set_auto){auto_base=fn;return CBR_RET_CONTINUE;}
     /* not while reviewing pictures or in ML's menu: a file must not be
      * swapped under Canon's playback while it is on screen */
     if(++auto_quiet<2||lens_info.job_state||get_halfshutter_pressed()||
        gui_menu_shown()||is_pure_play_photo_or_movie_mode())return CBR_RET_CONTINUE;
-    auto_upto=fn;job_total=0;job_pos=0;job_ok=job_failed=job_skipped=job_deleted=job_kept=0;
+    auto_upto=fn;auto_upto_folder=folder;job_total=0;job_pos=0;job_ok=job_failed=job_skipped=job_deleted=job_kept=0;
     last_out[0]=0;last_from[0]=0;
     cancel_job=0;progress_pct=0;job_result=0;job_t0=get_ms_clock();
     job_auto=1;busy=1;
@@ -1118,12 +1398,15 @@ static unsigned int soup_clock(unsigned int ctx)
  * drawn straight into the 8-bit overlay in ML's grey ramp: the palette has
  * no room for colour previews.
  */
-enum {G_STOCK, G_SETTINGS, G_DEVMENU, G_PICK, G_WORK, G_DONE};
+enum {G_STOCK, G_SETTINGS, G_RENDER, G_DEVMENU, G_PICK, G_WORK, G_DONE};
+enum { SETUP_SIZE, SETUP_OUTPUT, SETUP_AUTO, SETUP_RENDER, SETUP_ROWS };
+enum { RENDER_HALATION, RENDER_GRAIN, RENDER_CACHE, RENDER_ROWS };
 enum {REQ_NONE, REQ_DEVMENU, REQ_LATEST, REQ_NEW, REQ_LASTN, REQ_PICKONE};
 static se_ui gui;
 static se_ui_stock gui_stocks[MAX_STOCKS];
 static volatile int gui_dirty, gui_close, gui_req, gui_save, gui_restock;
-static volatile int gmode, gsetting, gdev, pick_i;
+static volatile int gui_stock_direction;
+static volatile int gmode, gsetting, grender, gdev, pick_i;
 static char gui_note[64], gui_info[64], gui_v[4][24], gui_lasthelp[32], gui_right[24], gui_title[24];
 static int dev_latest=-1, dev_new;
 static const int lastn_choices[5]={2,3,5,10,20};
@@ -1133,8 +1416,10 @@ static uint16_t sel_buf[MAX_JOB];
 static uint8_t *pk_hdr, *pk_arena, *pk_gray;
 static int pk_loaded=-2, pk_ok, pk_w, pk_h, pk_orient;
 
+/* The 7D screen has an opaque paper background, so the clear slot is free. */
+enum { STOCK_LEADER_COLOUR = SE_C_CLEAR };
 static const uint8_t gui_colours[16]={
-    COLOR_BLACK,        /* CLEAR  (opaque here: nothing should show through) */
+    [STOCK_LEADER_COLOUR] = COLOR_BLUE, /* dark indigo film leader */
     COLOR_GRAY(6),      /* INK    */
     COLOR_GRAY(22),     /* SHADOW */
     COLOR_GRAY(38),     /* SLATE  */
@@ -1152,11 +1437,11 @@ static const uint8_t gui_colours[16]={
     COLOR_WHITE,        /* WHITE  */
 };
 
-static void gui_blit(const uint8_t *fb)
+static void gui_blit_rows(const uint8_t *fb, int first, int count)
 {
     uint8_t *v=bmp_vram();int x,y;
     if(!v)return;
-    for(y=0;y<SE_UI_H;y++){
+    for(y=first;y<first+count;y++){
         const uint8_t *src=fb+y*SE_UI_PITCH;
         uint8_t *d0=v+(2*y)*BMPPITCH,*d1=d0+BMPPITCH;
         for(x=0;x<SE_UI_PITCH;x++){
@@ -1165,6 +1450,11 @@ static void gui_blit(const uint8_t *fb)
             d0[2*x]=lo;d0[2*x+1]=hi;d1[2*x]=lo;d1[2*x+1]=hi;
         }
     }
+}
+
+static void gui_blit(const uint8_t *fb)
+{
+    gui_blit_rows(fb, 0, SE_UI_H);
 }
 
 /* Thumbnail into a box of the 8-bit overlay, rotated per EXIF and scaled
@@ -1271,13 +1561,12 @@ static void draw_picker(se_ui_fb *fb)
  * screen with port-supplied rows. */
 static void gui_prepare(void)
 {
-    gui.stock=stock_count?stock_pos(selected_stock):0;
     snprintf(gui_info,sizeof(gui_info),"%s / %s%s",set_res==0?"FULL":"HALF",mode_names[set_mode],set_auto?" / AUTO":"");
     gui.info_label="OUTPUT: ";gui.info_value=gui_info;
     gui.info_colour=0;
     gui.value[SE_SET_SOURCE]=SE_SOURCE_PREVIEW;gui.value[SE_SET_RES]=set_res;
     if(gmode==G_SETTINGS){
-        gui.screen=SE_SCREEN_SETTINGS;gui.set_n=3;gui.setting=gsetting;
+        gui.screen=SE_SCREEN_SETTINGS;gui.set_n=SETUP_ROWS;gui.setting=gsetting;
         gui.settings_title=0;gui.settings_right=0;
         gui.set_label[0]="SIZE";      gui.set_value[0]=set_res==0?"FULL  5184 PX":"HALF  2592 PX";
         gui.set_help[0]="FULL TAKES ABOUT FOUR TIMES AS LONG";
@@ -1290,6 +1579,28 @@ static void gui_prepare(void)
         gui.set_label[1]="OUTPUT";gui.set_value[1]=mode_names[set_mode];gui.set_help[1]=mode_help[set_mode];}
         gui.set_label[2]="AUTO DEVELOP";gui.set_value[2]=set_auto?"ON":"OFF";
         gui.set_help[2]=set_auto?"DEVELOPS AUTOMATICALLY WHEN YOU STOP SHOOTING":"DEVELOP BY HAND WITH SET ON THE FILM SCREEN";
+        gui.set_label[SETUP_RENDER]="RENDER";
+        gui.set_value[SETUP_RENDER]=SE_SYM_RIGHT;
+        gui.set_help[SETUP_RENDER]="HALATION, GRAIN AND COLOR CACHE";
+        gui.settings_hint=gsetting==SETUP_RENDER?"[DIAL] ROW   [SET] OPEN   [MENU] BACK":
+                                                "[DIAL] ROW   [\x01\x02] CHANGE   [SET] BACK";
+    }else if(gmode==G_RENDER){
+        static const char *const halation_help[HALATION_COUNT]={
+            "USE THE FILM STOCK'S HALATION",
+            "SKIP EMPTY GLOW WITHOUT CHANGING THE LOOK",
+            "TURN OFF THE FILM STOCK'S HALATION"
+        };
+        gui.screen=SE_SCREEN_SETTINGS;gui.set_n=RENDER_ROWS;gui.setting=grender;
+        gui.settings_title="RENDER";gui.settings_right=0;
+        gui.set_label[RENDER_HALATION]="HALATION";
+        gui.set_value[RENDER_HALATION]=halation_names[set_render.halation];
+        gui.set_help[RENDER_HALATION]=halation_help[set_render.halation];
+        gui.set_label[RENDER_GRAIN]="GRAIN";
+        gui.set_value[RENDER_GRAIN]=set_render.grain?"STOCK":"OFF";
+        gui.set_help[RENDER_GRAIN]=set_render.grain?"USE THE FILM STOCK'S GRAIN":"TURN OFF THE FILM STOCK'S GRAIN";
+        gui.set_label[RENDER_CACHE]="COLOR CACHE";
+        gui.set_value[RENDER_CACHE]=cache_names[set_render.cache];
+        gui.set_help[RENDER_CACHE]="MORE MEMORY FOR THE SAME COLORS";
         gui.settings_hint="[DIAL] ROW   [\x01\x02] CHANGE   [SET] BACK";
     }else if(gmode==G_DEVMENU){
         gui.screen=SE_SCREEN_SETTINGS;gui.set_n=4;gui.setting=gdev;
@@ -1378,9 +1689,70 @@ static void gui_fill_stocks(void)
     gui.stock=stock_count?stock_pos(selected_stock):0;
 }
 
+enum {
+    STOCK_LEADER_MS = 96, STOCK_SLIDE_MS = 220, STOCK_FRAME_MS = 16,
+    STOCK_SLIDE_END_MS = STOCK_LEADER_MS + STOCK_SLIDE_MS,
+    STOCK_TRANSITION_MS = STOCK_SLIDE_END_MS + STOCK_LEADER_MS
+};
+
+typedef struct {
+    int target;
+    int direction;
+    unsigned changed_at;
+} gui_stock_motion;
+
+static int stock_ease(unsigned elapsed, unsigned duration)
+{
+    int t = elapsed * 256 / duration;
+    return t * t * (768 - 2 * t) / (256 * 256);
+}
+
+static void gui_update_stock_motion(gui_stock_motion *motion, int target, unsigned now)
+{
+    unsigned elapsed = now - motion->changed_at;
+
+    gui.stock = target;
+    gui.stock_slide = 0;
+    gui.stock_leader_retract = 0;
+    if (motion->target < 0) {
+        motion->target = target;
+        motion->changed_at = now - STOCK_SLIDE_MS;
+        return;
+    }
+    if (target != motion->target) {
+        int direction = gui_stock_direction;
+        int n = gui.nstocks;
+        unsigned min_gap = motion->direction ? STOCK_TRANSITION_MS : STOCK_SLIDE_MS;
+
+        /* Follow a fast dial burst immediately instead of replaying steps. */
+        motion->direction = n > 1 && direction && elapsed >= min_gap &&
+                            (motion->target + n + direction) % n == target
+                            ? direction : 0;
+        gui.stock_slide_from = motion->target;
+        motion->target = target;
+        motion->changed_at = now;
+        elapsed = 0;
+    }
+    if (!motion->direction) return;
+
+    if (elapsed < STOCK_LEADER_MS) {
+        gui.stock = gui.stock_slide_from;
+        gui.stock_leader_retract = stock_ease(elapsed, STOCK_LEADER_MS);
+    } else if (elapsed < STOCK_SLIDE_END_MS) {
+        gui.stock_leader_retract = 256;
+        gui.stock_slide = motion->direction *
+                          (256 - stock_ease(elapsed - STOCK_LEADER_MS, STOCK_SLIDE_MS));
+    } else if (elapsed < STOCK_TRANSITION_MS) {
+        gui.stock_leader_retract = 256 - stock_ease(elapsed - STOCK_SLIDE_END_MS, STOCK_LEADER_MS);
+    } else {
+        motion->direction = 0;
+    }
+}
+
 static void gui_task(void *unused)
 {
     uint8_t *fb=0;se_ui_fb f;int waited,last=0,done_at=0;
+    gui_stock_motion motion = { .target = -1 };
     (void)unused;
     fb=tmp_malloc(SE_UI_FB_SIZE);   /* off Canon heap: see Err70 notes */
     if(!fb)goto out;
@@ -1393,14 +1765,21 @@ static void gui_task(void *unused)
     gui_fill_stocks();gui.ready=1;
     gui_dirty=1;
     while(!gui_close&&gui_menu_shown()&&!ml_shutdown_requested&&!stop_worker){
-        if(gui_restock){gui_restock=0;gui_fill_stocks();}
+        int redraw_all;
+        unsigned frame_started;
+
+        if(gui_restock){
+            gui_restock=0;
+            gui_fill_stocks();
+            motion = (gui_stock_motion){ .target = -1 };
+            gui_dirty=1;
+        }
         /* opened by auto develop: the shutter takes priority (the job stops on
          * the same half-press), and the result shows for a moment, then goes */
         if(gui_auto){
             if(get_halfshutter_pressed()||lv)break;   /* Live View came back */
             if(gmode==G_DONE){if(!done_at)done_at=get_ms_clock();else if(get_ms_clock()-done_at>2500)break;}
         }
-        if(gui_save){gui_save=0;save_cfg();}
         if(gui_req)gui_handle_request();
         if(busy&&gmode!=G_WORK){gmode=G_WORK;gui_dirty=1;}
         if(!busy&&gmode==G_WORK){gui_finish_job();gui_dirty=1;}
@@ -1409,15 +1788,42 @@ static void gui_task(void *unused)
             pick_load(pick_i);gui_dirty=1;          /* keys may move on; reloads next pass */
         }
         if(gmode!=G_PICK&&pk_loaded!=-2)pick_free();
-        if(gui_dirty||(busy&&get_ms_clock()-last>300)){
-            gui_dirty=0;
+        if(gmode!=G_STOCK){
+            motion = (gui_stock_motion){ .target = -1 };
+            gui.stock_slide = 0;
+            gui.stock_leader_retract = 0;
+        }
+        frame_started=(unsigned)get_ms_clock();
+        redraw_all=gui_dirty||(busy&&frame_started-(unsigned)last>300);
+        if(redraw_all||motion.direction){
+            if(redraw_all)gui_dirty=0;
             if(gmode==G_PICK){
                 draw_picker(&f);gui_blit(fb);
                 if(pk_loaded==pick_i&&pk_ok)pick_blit_thumb(pk_gray,pk_w,pk_h,pk_orient);
-            }else{gui_prepare();se_ui_draw(&gui,&f);gui_blit(fb);}
+            }else{
+                if(redraw_all)gui_prepare();
+                if(gui.screen==SE_SCREEN_STOCK){
+                    int previous = gui.stock;
+                    int target = redraw_all ? (stock_count ? stock_pos(selected_stock) : 0)
+                                            : motion.target;
+                    gui_update_stock_motion(&motion,target,frame_started);
+                    if(gui.stock!=previous)redraw_all=1;
+                }
+                if(redraw_all){
+                    se_ui_draw(&gui,&f);
+                    gui_blit(fb);
+                }else{
+                    se_ui_redraw_stock_art(&gui,&f);
+                    gui_blit_rows(fb,SE_UI_STOCK_ART_TOP,SE_UI_STOCK_ART_ROWS);
+                }
+            }
             last=get_ms_clock();
         }
-        msleep(40);
+        if(gui_save&&!motion.direction){gui_save=0;save_cfg();}
+        if(motion.direction){
+            unsigned spent=(unsigned)get_ms_clock()-frame_started;
+            msleep(spent<STOCK_FRAME_MS ? STOCK_FRAME_MS-spent : 1);
+        }else msleep(40);
     }
 out:
     if(gui_save){gui_save=0;save_cfg();}
@@ -1437,11 +1843,13 @@ static int gui_open(void)
 {
     if(gui_task_alive)return -1;
     se_ui_init(&gui);
+    gui.stock_leader_colour=STOCK_LEADER_COLOUR;
     se_ui_set_stocks(&gui,gui_stocks,0);   /* filled by the GUI task */
     gui.ready=loaded;gui.stock=0;
     gui.stock_hint="[\x01\x02] FILM  [SET] DEVELOP  [Q] FAV  [INFO] SETUP  [MENU] CLOSE";
     gmode=busy?G_WORK:G_STOCK;gsetting=0;gdev=0;pick_i=0;
     gui_close=0;gui_req=REQ_NONE;gui_save=0;gui_dirty=1;pk_loaded=-2;
+    gui_stock_direction=0;
     gui_task_alive=1;gui_running=1;
     menu_redraw_blocked=1;           /* ML's menu must never paint over us */
     if(IS_ERROR(task_create("soup7d_gui",0x1c,0x4000,gui_task,0))){
@@ -1460,12 +1868,18 @@ static void gui_turn(int dir)
     int step=dir>0?1:-1;
     switch(gmode){
     case G_STOCK:
-        if(stock_count){stock_step(step);gui_save=1;}
+        if(stock_count>1){stock_step(step);gui_stock_direction=step;gui_save=1;}
         break;
     case G_SETTINGS:
-        if(gsetting==0)set_res=!set_res;
-        else if(gsetting==1)set_mode=(set_mode+step+M_COUNT)%M_COUNT;
-        else set_auto=!set_auto;
+        if(gsetting==SETUP_SIZE)set_res=!set_res;
+        else if(gsetting==SETUP_OUTPUT)set_mode=(set_mode+step+M_COUNT)%M_COUNT;
+        else if(gsetting==SETUP_AUTO)set_auto=!set_auto;
+        break;
+    case G_RENDER:
+        if(grender==RENDER_HALATION)set_render.halation=(set_render.halation+step+HALATION_COUNT)%HALATION_COUNT;
+        else if(grender==RENDER_GRAIN)set_render.grain=!set_render.grain;
+        else set_render.cache=(set_render.cache+step+SE_LOOK_CACHE_COUNT)%SE_LOOK_CACHE_COUNT;
+        gui_save=1;
         break;
     case G_DEVMENU:
         if(gdev==3){int n=set_lastn+step;if(n>=0&&n<5)set_lastn=n;gui_save=1;}
@@ -1479,7 +1893,8 @@ static void gui_turn(int dir)
 }
 static void gui_row(int step)
 {
-    if(gmode==G_SETTINGS)gsetting=(gsetting+step+3)%3;
+    if(gmode==G_SETTINGS)gsetting=(gsetting+step+SETUP_ROWS)%SETUP_ROWS;
+    else if(gmode==G_RENDER)grender=(grender+step+RENDER_ROWS)%RENDER_ROWS;
     else if(gmode==G_DEVMENU)gdev=(gdev+step+4)%4;
     else if(gmode==G_PICK)gui_turn(step);
 }
@@ -1487,7 +1902,11 @@ static void gui_set(void)
 {
     switch(gmode){
     case G_STOCK:   if(!busy&&!gui_req)gui_req=REQ_DEVMENU;break;
-    case G_SETTINGS:gmode=G_STOCK;gui_save=1;break;
+    case G_SETTINGS:
+        if(gsetting==SETUP_RENDER){grender=RENDER_HALATION;gmode=G_RENDER;}
+        else{gmode=G_STOCK;gui_save=1;}
+        break;
+    case G_RENDER:gmode=G_SETTINGS;break;
     case G_DEVMENU:
         if(gui_req)break;
         if(gdev==0){gmode=G_PICK;pick_i=dev_latest>=0?dev_latest:nframes-1;}
@@ -1502,6 +1921,7 @@ static void gui_back(void)
     switch(gmode){
     case G_WORK:    cancel_job=1;break;           /* MENU cancels a running job */
     case G_SETTINGS:gmode=G_STOCK;gui_save=1;break;
+    case G_RENDER:gmode=G_SETTINGS;break;
     case G_DEVMENU: gmode=G_STOCK;break;
     case G_PICK:    gmode=G_DEVMENU;break;
     case G_DONE:    gmode=G_STOCK;break;
@@ -1522,8 +1942,8 @@ static unsigned int soup_keypress(unsigned int key)
     /* 7D: rear dial = WHEEL_UP/DOWN, top dial = WHEEL_LEFT/RIGHT */
     case MODULE_KEY_PRESS_LEFT: gui_turn(-1);break;
     case MODULE_KEY_PRESS_RIGHT:gui_turn(1);break;
-    case MODULE_KEY_WHEEL_UP:   if(gmode==G_DEVMENU||gmode==G_SETTINGS)gui_row(-1);else gui_turn(-1);break;
-    case MODULE_KEY_WHEEL_DOWN: if(gmode==G_DEVMENU||gmode==G_SETTINGS)gui_row(1);else gui_turn(1);break;
+    case MODULE_KEY_WHEEL_UP:   if(gmode==G_DEVMENU||gmode==G_SETTINGS||gmode==G_RENDER)gui_row(-1);else gui_turn(-1);break;
+    case MODULE_KEY_WHEEL_DOWN: if(gmode==G_DEVMENU||gmode==G_SETTINGS||gmode==G_RENDER)gui_row(1);else gui_turn(1);break;
     case MODULE_KEY_WHEEL_LEFT: gui_turn(gmode==G_PICK?-10:-1);break;
     case MODULE_KEY_WHEEL_RIGHT:gui_turn(gmode==G_PICK?10:1);break;
     case MODULE_KEY_PRESS_UP:   gui_row(-1);break;
@@ -1531,7 +1951,7 @@ static unsigned int soup_keypress(unsigned int key)
     case MODULE_KEY_PRESS_SET:case MODULE_KEY_JOY_CENTER: gui_set();break;
     case MODULE_KEY_INFO:
         if(gmode==G_STOCK&&!busy){gmode=G_SETTINGS;gsetting=0;}
-        else if(gmode==G_SETTINGS){gmode=G_STOCK;gui_save=1;}
+        else if(gmode==G_SETTINGS||gmode==G_RENDER)gui_back();
         break;
     case MODULE_KEY_MENU: gui_back();break;
     case MODULE_KEY_Q:

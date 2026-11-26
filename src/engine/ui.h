@@ -22,6 +22,10 @@
 #define SE_UI_PITCH  360                      /* bytes per row */
 #define SE_UI_FB_SIZE (SE_UI_PITCH * SE_UI_H)
 
+/* Rows occupied by the stock artwork and its navigation arrows. */
+#define SE_UI_STOCK_ART_TOP  36
+#define SE_UI_STOCK_ART_ROWS 92
+
 #define SE_FONT_W      5
 #define SE_FONT_H      7
 #define SE_FONT_GLYPHS 68
@@ -154,6 +158,10 @@ typedef struct {
     int nstocks;
 
     int stock;                 /* index into `stocks`                 */
+    int stock_slide_from;      /* outgoing stock index                */
+    int stock_slide;           /* signed incoming offset in 1/256 of the slide */
+    int stock_leader_retract;  /* leader retraction, 0 = exposed, 256 = hidden */
+    uint8_t stock_leader_colour; /* palette index of the exposed film leader */
     int setting;               /* cursor on the settings screen     */
     int value[SE_SET_COUNT];
 
@@ -204,6 +212,8 @@ void se_ui_init(se_ui *u);
 void se_ui_set_stocks(se_ui *u, const se_ui_stock *list, int n);
 void se_ui_key_press(se_ui *u, se_ui_key k);
 void se_ui_draw(const se_ui *u, se_ui_fb *fb);
+/* Refresh the artwork band of an already drawn stock screen. */
+void se_ui_redraw_stock_art(const se_ui *u, se_ui_fb *fb);
 
 /* Paper, header and footer exactly as the built-in screens draw them, for
  * screens a port draws itself (the 7D frame picker). */

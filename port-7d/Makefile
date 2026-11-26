@@ -10,7 +10,10 @@ CFLAGS := -std=gnu99 -O2 -march=armv5te -marm -msoft-float -ffreestanding -fno-b
 MLFLAGS := -DMODULE -DMODULE_NAME=soup7d -DCONFIG_MAGICLANTERN -D__ARM__ -I. -I$(ML)/platform/all -I$(ML)/src -I$(ML)/modules/lua/dietlibc/include
 NAMES := se cr2 jpeg_dec jpeg_enc look stock wb color grade lut ui ui_font
 OBJS := build/soup7d.o $(addprefix build/,$(addsuffix .o,$(NAMES)))
+PARTS := $(addprefix parts/,head.c part_frames.c part_meta.c part_job.c part_gui.c tail.c)
 all: build/soup7d.mo
+soup7d.c: $(PARTS) Makefile
+	cat $(PARTS) > $@.tmp && mv -f $@.tmp $@
 build:
 	mkdir -p $@
 # The module glue (menus, GUI, file handling) is sized for resident memory,

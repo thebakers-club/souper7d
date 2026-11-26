@@ -12,12 +12,15 @@
  * drawn straight into the 8-bit overlay in ML's grey ramp: the palette has
  * no room for colour previews.
  */
-enum {G_STOCK, G_SETTINGS, G_DEVMENU, G_PICK, G_WORK, G_DONE};
+enum {G_STOCK, G_SETTINGS, G_RENDER, G_DEVMENU, G_PICK, G_WORK, G_DONE};
+enum { SETUP_SIZE, SETUP_OUTPUT, SETUP_AUTO, SETUP_RENDER, SETUP_ROWS };
+enum { RENDER_HALATION, RENDER_GRAIN, RENDER_CACHE, RENDER_ROWS };
 enum {REQ_NONE, REQ_DEVMENU, REQ_LATEST, REQ_NEW, REQ_LASTN, REQ_PICKONE};
 static se_ui gui;
 static se_ui_stock gui_stocks[MAX_STOCKS];
 static volatile int gui_dirty, gui_close, gui_req, gui_save, gui_restock;
-static volatile int gmode, gsetting, gdev, pick_i;
+static volatile int gui_stock_direction;
+static volatile int gmode, gsetting, grender, gdev, pick_i;
 static char gui_note[64], gui_info[64], gui_v[4][24], gui_lasthelp[32], gui_right[24], gui_title[24];
 static int dev_latest=-1, dev_new;
 static const int lastn_choices[5]={2,3,5,10,20};
@@ -27,8 +30,10 @@ static uint16_t sel_buf[MAX_JOB];
 static uint8_t *pk_hdr, *pk_arena, *pk_gray;
 static int pk_loaded=-2, pk_ok, pk_w, pk_h, pk_orient;
 
+/* The 7D screen has an opaque paper background, so the clear slot is free. */
+enum { STOCK_LEADER_COLOUR = SE_C_CLEAR };
 static const uint8_t gui_colours[16]={
-    COLOR_BLACK,        /* CLEAR  (opaque here: nothing should show through) */
+    [STOCK_LEADER_COLOUR] = COLOR_BLUE, /* dark indigo film leader */
     COLOR_GRAY(6),      /* INK    */
     COLOR_GRAY(22),     /* SHADOW */
     COLOR_GRAY(38),     /* SLATE  */
@@ -46,11 +51,11 @@ static const uint8_t gui_colours[16]={
     COLOR_WHITE,        /* WHITE  */
 };
 
-static void gui_blit(const uint8_t *fb)
+static void gui_blit_rows(const uint8_t *fb, int first, int count)
 {
     uint8_t *v=bmp_vram();int x,y;
     if(!v)return;
-    for(y=0;y<SE_UI_H;y++){
+    for(y=first;y<first+count;y++){
         const uint8_t *src=fb+y*SE_UI_PITCH;
         uint8_t *d0=v+(2*y)*BMPPITCH,*d1=d0+BMPPITCH;
         for(x=0;x<SE_UI_PITCH;x++){
@@ -59,6 +64,11 @@ static void gui_blit(const uint8_t *fb)
             d0[2*x]=lo;d0[2*x+1]=hi;d1[2*x]=lo;d1[2*x+1]=hi;
         }
     }
+}
+
+static void gui_blit(const uint8_t *fb)
+{
+    gui_blit_rows(fb, 0, SE_UI_H);
 }
 
 /* Thumbnail into a box of the 8-bit overlay, rotated per EXIF and scaled
@@ -165,13 +175,12 @@ static void draw_picker(se_ui_fb *fb)
  * screen with port-supplied rows. */
 static void gui_prepare(void)
 {
-    gui.stock=stock_count?stock_pos(selected_stock):0;
     snprintf(gui_info,sizeof(gui_info),"%s / %s%s",set_res==0?"FULL":"HALF",mode_names[set_mode],set_auto?" / AUTO":"");
     gui.info_label="OUTPUT: ";gui.info_value=gui_info;
     gui.info_colour=0;
     gui.value[SE_SET_SOURCE]=SE_SOURCE_PREVIEW;gui.value[SE_SET_RES]=set_res;
     if(gmode==G_SETTINGS){
-        gui.screen=SE_SCREEN_SETTINGS;gui.set_n=3;gui.setting=gsetting;
+        gui.screen=SE_SCREEN_SETTINGS;gui.set_n=SETUP_ROWS;gui.setting=gsetting;
         gui.settings_title=0;gui.settings_right=0;
         gui.set_label[0]="SIZE";      gui.set_value[0]=set_res==0?"FULL  5184 PX":"HALF  2592 PX";
         gui.set_help[0]="FULL TAKES ABOUT FOUR TIMES AS LONG";
@@ -184,6 +193,28 @@ static void gui_prepare(void)
         gui.set_label[1]="OUTPUT";gui.set_value[1]=mode_names[set_mode];gui.set_help[1]=mode_help[set_mode];}
         gui.set_label[2]="AUTO DEVELOP";gui.set_value[2]=set_auto?"ON":"OFF";
         gui.set_help[2]=set_auto?"DEVELOPS AUTOMATICALLY WHEN YOU STOP SHOOTING":"DEVELOP BY HAND WITH SET ON THE FILM SCREEN";
+        gui.set_label[SETUP_RENDER]="RENDER";
+        gui.set_value[SETUP_RENDER]=SE_SYM_RIGHT;
+        gui.set_help[SETUP_RENDER]="HALATION, GRAIN AND COLOR CACHE";
+        gui.settings_hint=gsetting==SETUP_RENDER?"[DIAL] ROW   [SET] OPEN   [MENU] BACK":
+                                                "[DIAL] ROW   [\x01\x02] CHANGE   [SET] BACK";
+    }else if(gmode==G_RENDER){
+        static const char *const halation_help[HALATION_COUNT]={
+            "USE THE FILM STOCK'S HALATION",
+            "SKIP EMPTY GLOW WITHOUT CHANGING THE LOOK",
+            "TURN OFF THE FILM STOCK'S HALATION"
+        };
+        gui.screen=SE_SCREEN_SETTINGS;gui.set_n=RENDER_ROWS;gui.setting=grender;
+        gui.settings_title="RENDER";gui.settings_right=0;
+        gui.set_label[RENDER_HALATION]="HALATION";
+        gui.set_value[RENDER_HALATION]=halation_names[set_render.halation];
+        gui.set_help[RENDER_HALATION]=halation_help[set_render.halation];
+        gui.set_label[RENDER_GRAIN]="GRAIN";
+        gui.set_value[RENDER_GRAIN]=set_render.grain?"STOCK":"OFF";
+        gui.set_help[RENDER_GRAIN]=set_render.grain?"USE THE FILM STOCK'S GRAIN":"TURN OFF THE FILM STOCK'S GRAIN";
+        gui.set_label[RENDER_CACHE]="COLOR CACHE";
+        gui.set_value[RENDER_CACHE]=cache_names[set_render.cache];
+        gui.set_help[RENDER_CACHE]="MORE MEMORY FOR THE SAME COLORS";
         gui.settings_hint="[DIAL] ROW   [\x01\x02] CHANGE   [SET] BACK";
     }else if(gmode==G_DEVMENU){
         gui.screen=SE_SCREEN_SETTINGS;gui.set_n=4;gui.setting=gdev;
@@ -272,9 +303,70 @@ static void gui_fill_stocks(void)
     gui.stock=stock_count?stock_pos(selected_stock):0;
 }
 
+enum {
+    STOCK_LEADER_MS = 96, STOCK_SLIDE_MS = 220, STOCK_FRAME_MS = 16,
+    STOCK_SLIDE_END_MS = STOCK_LEADER_MS + STOCK_SLIDE_MS,
+    STOCK_TRANSITION_MS = STOCK_SLIDE_END_MS + STOCK_LEADER_MS
+};
+
+typedef struct {
+    int target;
+    int direction;
+    unsigned changed_at;
+} gui_stock_motion;
+
+static int stock_ease(unsigned elapsed, unsigned duration)
+{
+    int t = elapsed * 256 / duration;
+    return t * t * (768 - 2 * t) / (256 * 256);
+}
+
+static void gui_update_stock_motion(gui_stock_motion *motion, int target, unsigned now)
+{
+    unsigned elapsed = now - motion->changed_at;
+
+    gui.stock = target;
+    gui.stock_slide = 0;
+    gui.stock_leader_retract = 0;
+    if (motion->target < 0) {
+        motion->target = target;
+        motion->changed_at = now - STOCK_SLIDE_MS;
+        return;
+    }
+    if (target != motion->target) {
+        int direction = gui_stock_direction;
+        int n = gui.nstocks;
+        unsigned min_gap = motion->direction ? STOCK_TRANSITION_MS : STOCK_SLIDE_MS;
+
+        /* Follow a fast dial burst immediately instead of replaying steps. */
+        motion->direction = n > 1 && direction && elapsed >= min_gap &&
+                            (motion->target + n + direction) % n == target
+                            ? direction : 0;
+        gui.stock_slide_from = motion->target;
+        motion->target = target;
+        motion->changed_at = now;
+        elapsed = 0;
+    }
+    if (!motion->direction) return;
+
+    if (elapsed < STOCK_LEADER_MS) {
+        gui.stock = gui.stock_slide_from;
+        gui.stock_leader_retract = stock_ease(elapsed, STOCK_LEADER_MS);
+    } else if (elapsed < STOCK_SLIDE_END_MS) {
+        gui.stock_leader_retract = 256;
+        gui.stock_slide = motion->direction *
+                          (256 - stock_ease(elapsed - STOCK_LEADER_MS, STOCK_SLIDE_MS));
+    } else if (elapsed < STOCK_TRANSITION_MS) {
+        gui.stock_leader_retract = 256 - stock_ease(elapsed - STOCK_SLIDE_END_MS, STOCK_LEADER_MS);
+    } else {
+        motion->direction = 0;
+    }
+}
+
 static void gui_task(void *unused)
 {
     uint8_t *fb=0;se_ui_fb f;int waited,last=0,done_at=0;
+    gui_stock_motion motion = { .target = -1 };
     (void)unused;
     fb=tmp_malloc(SE_UI_FB_SIZE);   /* off Canon heap: see Err70 notes */
     if(!fb)goto out;
@@ -287,14 +379,21 @@ static void gui_task(void *unused)
     gui_fill_stocks();gui.ready=1;
     gui_dirty=1;
     while(!gui_close&&gui_menu_shown()&&!ml_shutdown_requested&&!stop_worker){
-        if(gui_restock){gui_restock=0;gui_fill_stocks();}
+        int redraw_all;
+        unsigned frame_started;
+
+        if(gui_restock){
+            gui_restock=0;
+            gui_fill_stocks();
+            motion = (gui_stock_motion){ .target = -1 };
+            gui_dirty=1;
+        }
         /* opened by auto develop: the shutter takes priority (the job stops on
          * the same half-press), and the result shows for a moment, then goes */
         if(gui_auto){
             if(get_halfshutter_pressed()||lv)break;   /* Live View came back */
             if(gmode==G_DONE){if(!done_at)done_at=get_ms_clock();else if(get_ms_clock()-done_at>2500)break;}
         }
-        if(gui_save){gui_save=0;save_cfg();}
         if(gui_req)gui_handle_request();
         if(busy&&gmode!=G_WORK){gmode=G_WORK;gui_dirty=1;}
         if(!busy&&gmode==G_WORK){gui_finish_job();gui_dirty=1;}
@@ -303,15 +402,42 @@ static void gui_task(void *unused)
             pick_load(pick_i);gui_dirty=1;          /* keys may move on; reloads next pass */
         }
         if(gmode!=G_PICK&&pk_loaded!=-2)pick_free();
-        if(gui_dirty||(busy&&get_ms_clock()-last>300)){
-            gui_dirty=0;
+        if(gmode!=G_STOCK){
+            motion = (gui_stock_motion){ .target = -1 };
+            gui.stock_slide = 0;
+            gui.stock_leader_retract = 0;
+        }
+        frame_started=(unsigned)get_ms_clock();
+        redraw_all=gui_dirty||(busy&&frame_started-(unsigned)last>300);
+        if(redraw_all||motion.direction){
+            if(redraw_all)gui_dirty=0;
             if(gmode==G_PICK){
                 draw_picker(&f);gui_blit(fb);
                 if(pk_loaded==pick_i&&pk_ok)pick_blit_thumb(pk_gray,pk_w,pk_h,pk_orient);
-            }else{gui_prepare();se_ui_draw(&gui,&f);gui_blit(fb);}
+            }else{
+                if(redraw_all)gui_prepare();
+                if(gui.screen==SE_SCREEN_STOCK){
+                    int previous = gui.stock;
+                    int target = redraw_all ? (stock_count ? stock_pos(selected_stock) : 0)
+                                            : motion.target;
+                    gui_update_stock_motion(&motion,target,frame_started);
+                    if(gui.stock!=previous)redraw_all=1;
+                }
+                if(redraw_all){
+                    se_ui_draw(&gui,&f);
+                    gui_blit(fb);
+                }else{
+                    se_ui_redraw_stock_art(&gui,&f);
+                    gui_blit_rows(fb,SE_UI_STOCK_ART_TOP,SE_UI_STOCK_ART_ROWS);
+                }
+            }
             last=get_ms_clock();
         }
-        msleep(40);
+        if(gui_save&&!motion.direction){gui_save=0;save_cfg();}
+        if(motion.direction){
+            unsigned spent=(unsigned)get_ms_clock()-frame_started;
+            msleep(spent<STOCK_FRAME_MS ? STOCK_FRAME_MS-spent : 1);
+        }else msleep(40);
     }
 out:
     if(gui_save){gui_save=0;save_cfg();}
@@ -331,11 +457,13 @@ static int gui_open(void)
 {
     if(gui_task_alive)return -1;
     se_ui_init(&gui);
+    gui.stock_leader_colour=STOCK_LEADER_COLOUR;
     se_ui_set_stocks(&gui,gui_stocks,0);   /* filled by the GUI task */
     gui.ready=loaded;gui.stock=0;
     gui.stock_hint="[\x01\x02] FILM  [SET] DEVELOP  [Q] FAV  [INFO] SETUP  [MENU] CLOSE";
     gmode=busy?G_WORK:G_STOCK;gsetting=0;gdev=0;pick_i=0;
     gui_close=0;gui_req=REQ_NONE;gui_save=0;gui_dirty=1;pk_loaded=-2;
+    gui_stock_direction=0;
     gui_task_alive=1;gui_running=1;
     menu_redraw_blocked=1;           /* ML's menu must never paint over us */
     if(IS_ERROR(task_create("soup7d_gui",0x1c,0x4000,gui_task,0))){
@@ -354,12 +482,18 @@ static void gui_turn(int dir)
     int step=dir>0?1:-1;
     switch(gmode){
     case G_STOCK:
-        if(stock_count){stock_step(step);gui_save=1;}
+        if(stock_count>1){stock_step(step);gui_stock_direction=step;gui_save=1;}
         break;
     case G_SETTINGS:
-        if(gsetting==0)set_res=!set_res;
-        else if(gsetting==1)set_mode=(set_mode+step+M_COUNT)%M_COUNT;
-        else set_auto=!set_auto;
+        if(gsetting==SETUP_SIZE)set_res=!set_res;
+        else if(gsetting==SETUP_OUTPUT)set_mode=(set_mode+step+M_COUNT)%M_COUNT;
+        else if(gsetting==SETUP_AUTO)set_auto=!set_auto;
+        break;
+    case G_RENDER:
+        if(grender==RENDER_HALATION)set_render.halation=(set_render.halation+step+HALATION_COUNT)%HALATION_COUNT;
+        else if(grender==RENDER_GRAIN)set_render.grain=!set_render.grain;
+        else set_render.cache=(set_render.cache+step+SE_LOOK_CACHE_COUNT)%SE_LOOK_CACHE_COUNT;
+        gui_save=1;
         break;
     case G_DEVMENU:
         if(gdev==3){int n=set_lastn+step;if(n>=0&&n<5)set_lastn=n;gui_save=1;}
@@ -373,7 +507,8 @@ static void gui_turn(int dir)
 }
 static void gui_row(int step)
 {
-    if(gmode==G_SETTINGS)gsetting=(gsetting+step+3)%3;
+    if(gmode==G_SETTINGS)gsetting=(gsetting+step+SETUP_ROWS)%SETUP_ROWS;
+    else if(gmode==G_RENDER)grender=(grender+step+RENDER_ROWS)%RENDER_ROWS;
     else if(gmode==G_DEVMENU)gdev=(gdev+step+4)%4;
     else if(gmode==G_PICK)gui_turn(step);
 }
@@ -381,7 +516,11 @@ static void gui_set(void)
 {
     switch(gmode){
     case G_STOCK:   if(!busy&&!gui_req)gui_req=REQ_DEVMENU;break;
-    case G_SETTINGS:gmode=G_STOCK;gui_save=1;break;
+    case G_SETTINGS:
+        if(gsetting==SETUP_RENDER){grender=RENDER_HALATION;gmode=G_RENDER;}
+        else{gmode=G_STOCK;gui_save=1;}
+        break;
+    case G_RENDER:gmode=G_SETTINGS;break;
     case G_DEVMENU:
         if(gui_req)break;
         if(gdev==0){gmode=G_PICK;pick_i=dev_latest>=0?dev_latest:nframes-1;}
@@ -396,6 +535,7 @@ static void gui_back(void)
     switch(gmode){
     case G_WORK:    cancel_job=1;break;           /* MENU cancels a running job */
     case G_SETTINGS:gmode=G_STOCK;gui_save=1;break;
+    case G_RENDER:gmode=G_SETTINGS;break;
     case G_DEVMENU: gmode=G_STOCK;break;
     case G_PICK:    gmode=G_DEVMENU;break;
     case G_DONE:    gmode=G_STOCK;break;
@@ -416,8 +556,8 @@ static unsigned int soup_keypress(unsigned int key)
     /* 7D: rear dial = WHEEL_UP/DOWN, top dial = WHEEL_LEFT/RIGHT */
     case MODULE_KEY_PRESS_LEFT: gui_turn(-1);break;
     case MODULE_KEY_PRESS_RIGHT:gui_turn(1);break;
-    case MODULE_KEY_WHEEL_UP:   if(gmode==G_DEVMENU||gmode==G_SETTINGS)gui_row(-1);else gui_turn(-1);break;
-    case MODULE_KEY_WHEEL_DOWN: if(gmode==G_DEVMENU||gmode==G_SETTINGS)gui_row(1);else gui_turn(1);break;
+    case MODULE_KEY_WHEEL_UP:   if(gmode==G_DEVMENU||gmode==G_SETTINGS||gmode==G_RENDER)gui_row(-1);else gui_turn(-1);break;
+    case MODULE_KEY_WHEEL_DOWN: if(gmode==G_DEVMENU||gmode==G_SETTINGS||gmode==G_RENDER)gui_row(1);else gui_turn(1);break;
     case MODULE_KEY_WHEEL_LEFT: gui_turn(gmode==G_PICK?-10:-1);break;
     case MODULE_KEY_WHEEL_RIGHT:gui_turn(gmode==G_PICK?10:1);break;
     case MODULE_KEY_PRESS_UP:   gui_row(-1);break;
@@ -425,7 +565,7 @@ static unsigned int soup_keypress(unsigned int key)
     case MODULE_KEY_PRESS_SET:case MODULE_KEY_JOY_CENTER: gui_set();break;
     case MODULE_KEY_INFO:
         if(gmode==G_STOCK&&!busy){gmode=G_SETTINGS;gsetting=0;}
-        else if(gmode==G_SETTINGS){gmode=G_STOCK;gui_save=1;}
+        else if(gmode==G_SETTINGS||gmode==G_RENDER)gui_back();
         break;
     case MODULE_KEY_MENU: gui_back();break;
     case MODULE_KEY_Q:

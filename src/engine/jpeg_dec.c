@@ -200,12 +200,9 @@ static int jd_decode(jd_bits *b, const jd_huff *h)
     int l, code;
     uint32_t e;
 
-    /*
-     * jd_fill leaves at least 25 bits in the buffer, so the eight peeked
-     * below are always real bits or the zero padding it supplies past a
-     * marker -- never uninitialised buffer.
-     */
-    if (b->cnt <= 24) jd_fill(b);
+    /* Refill only when the eight-bit lookup needs it. jd_get refills
+     * separately when the coefficient magnitude needs more bits. */
+    if (b->cnt < 8) jd_fill(b);
     e = h->look[b->buf >> 24];
     if (e) {
         l = (int)(e & 31);
@@ -214,7 +211,8 @@ static int jd_decode(jd_bits *b, const jd_huff *h)
         return (int)(e >> 5);
     }
 
-    l = 1; code = (int)jd_get(b, 1);
+    /* A lookup miss has already ruled out codes of length 1..8. */
+    l = 8; code = (int)jd_get(b, 8);
     while (l <= 16 && code > h->maxcode[l]) {
         code = (code << 1) | (int)jd_get(b, 1);
         l++;
@@ -256,22 +254,7 @@ static const int16_t jd_ct[8][8] __attribute__((unused)) = {
 
 #define JD_DESCALE(x, n) (((x) + (1 << ((n) - 1))) >> (n))
 
-/*
- * Flat block: every coefficient but DC is zero, so the transform collapses
- * to one value repeated. Worth testing for because it is the common case --
- * empty sky, out-of-focus background, and most chroma blocks in most
- * frames. The test costs at most 63 compares against 1024
- * multiply-accumulates.
- */
-static int jd_flat(const int *in, int n)
-{
-    int x, y;
-    for (y = 0; y < n; y++)
-        for (x = 0; x < n; x++)
-            if ((x | y) && in[y * 8 + x]) return 0;
-    return 1;
-}
-
+/* A DC-only block transforms to a single repeated sample. */
 static void jd_fill_block(uint8_t *out, int stride, int n, int dc)
 {
     int v = JD_DESCALE(JD_DESCALE(5793 * dc, 11) * 5793, 17) + 128;
@@ -330,8 +313,6 @@ static void jd_idct(const int *in, uint8_t *out, int stride)
 {
     int tmp[64], v[8];
     int x, y;
-
-    if (jd_flat(in, 8)) { jd_fill_block(out, stride, 8, in[0]); return; }
 
     /* columns */
     for (x = 0; x < 8; x++) {
@@ -395,8 +376,6 @@ static void jd_idct4(const int *in, uint8_t *out, int stride)
      * 6 multiplies per 4 points instead of 16, bit-identical. */
     int tmp[16];
     int x, y;
-
-    if (jd_flat(in, 4)) { jd_fill_block(out, stride, 4, in[0]); return; }
 
     for (x = 0; x < 4; x++) {
         int a = in[x], b = in[8 + x], c = in[16 + x], d = in[24 + x];
@@ -752,9 +731,10 @@ static se_err jd_run(const uint8_t *d, size_t len,
                             uint8_t *o = c->plane
                                 + (size_t)by * s->bs * c->pw
                                 + (size_t)(mx * c->hs + bx) * s->bs;
-                            /* not timed: a clock read per block cost more
-                             * than some of the transforms it measured */
-                            if (s->bs == 8) jd_idct(blk, o, c->pw);
+                            /* The decoded AC count already tells us whether
+                             * the block is flat at the requested size. */
+                            if (!nset) jd_fill_block(o, c->pw, s->bs, blk[0]);
+                            else if (s->bs == 8) jd_idct(blk, o, c->pw);
                             else            jd_idct4(blk, o, c->pw);
                         }
                         /* Clear only what was written: a block holds ~20
@@ -794,15 +774,15 @@ static se_err jd_run(const uint8_t *d, size_t len,
                     const uint8_t *cl = s->clamp + 384;
                     for (; x + 1 < s->ow; x += 2) {
                         int Cbv = bb[x >> 1] - 128, Crv = rr[x >> 1] - 128;
-                        int cr_r2 = 91881 * Crv, g2 = 22554 * Cbv + 46802 * Crv;
-                        int cb_b2 = 116130 * Cbv, k;
+                        /* Luma is an integer, so round the chroma terms
+                         * once per pair before adding either pixel's Y. */
+                        const uint8_t *red = cl + ((91881 * Crv) >> 16);
+                        const uint8_t *green = cl + ((-22554 * Cbv - 46802 * Crv) >> 16);
+                        const uint8_t *blue = cl + ((116130 * Cbv) >> 16);
                         uint8_t *op = orow + x * 3;
-                        for (k = 0; k < 2; k++, op += 3) {
-                            int Yv = yy[x + k] << 16;
-                            op[0] = cl[(Yv + cr_r2) >> 16];
-                            op[1] = cl[(Yv - g2) >> 16];
-                            op[2] = cl[(Yv + cb_b2) >> 16];
-                        }
+                        int y0 = yy[x], y1 = yy[x + 1];
+                        op[0] = red[y0]; op[1] = green[y0]; op[2] = blue[y0];
+                        op[3] = red[y1]; op[4] = green[y1]; op[5] = blue[y1];
                     }
                 }
                 for (; x < s->ow; x++) {

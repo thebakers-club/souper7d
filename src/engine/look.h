@@ -183,6 +183,22 @@ size_t se_look_fit(se_look *lk, int width, size_t budget);
 se_err se_look_begin(se_look_run **run, const se_look *lk,
                      int width, se_arena *ar);
 
+enum { SE_LOOK_CACHE_4K, SE_LOOK_CACHE_8K, SE_LOOK_CACHE_16K, SE_LOOK_CACHE_COUNT };
+size_t se_look_cache_extra(int cache);
+se_err se_look_begin_with_options(se_look_run **run, const se_look *lk,
+                                  int width, se_arena *ar, int cache,
+                                  int skip_empty_halation);
+
+typedef struct {
+    int (*clock_ms)(void);
+    unsigned grade_ms, mask_ms, glow_ms, grain_ms;
+    unsigned cache_hits, cache_misses;
+} se_look_timing;
+
+/* Optional caller-owned counters. Zero them and set the clock before attaching;
+ * keep them alive through se_look_end. Passing null disables timing. */
+void se_look_set_timing(se_look_run *run, se_look_timing *timing);
+
 /* Each finished row is handed to `emit`, which returns 0 to continue. */
 typedef int (*se_look_emit)(void *ctx, const uint8_t *row, int width);
 

@@ -1,5 +1,13 @@
 # Souper7D
 
+This community fork is maintained by [@EntoncesRMFC](https://github.com/EntoncesRMFC)
+and is based on version 0.1.1 of [thebakers-club/Souper7D](https://github.com/thebakers-club/souper7d).
+It uses the same [GNU GPL v2 licence](LICENSE) as upstream.
+
+Build 20 is this fork's build number. It includes a pixel-art film picker with
+animated film leaders, frame tracking across DCIM folders, adjustable halation,
+grain and colour-cache settings, and JPEG encoding tuned on the EOS 7D.
+
 Film looks developed inside the original Canon EOS 7D. Souper7D is a
 [Magic Lantern](https://www.magiclantern.fm/) module that runs your photos
 through 27 film stocks on the camera itself: pick a film, press SET, and a
@@ -56,7 +64,7 @@ Press **Picture Style** (or open the **Film** tab in the ML menu) to get the fil
 | Dial / joystick | Change film |
 | **SET** | Develop menu |
 | **Q** | Mark the film as a favourite (favourites come first) |
-| **INFO** | Settings: size, output mode, auto develop |
+| **INFO** | Settings: size, output mode, auto develop and rendering |
 | **MENU** or half-press | Close |
 
 The develop menu offers **PICK** (browse frames with a thumbnail), **LATEST**,
@@ -64,6 +72,19 @@ The develop menu offers **PICK** (browse frames with a thumbnail), **LATEST**,
 A half-press cancels a develop; a cancelled frame is left untouched.
 
 Size is HALF (2592 px wide) or FULL (5184 px, about four times as long).
+
+In **SETUP → RENDER**, use the rear dial to select a row and the top dial
+or left/right to change its value. The options are saved for the next job.
+
+| Option | Values |
+| --- | --- |
+| HALATION | STOCK uses the recipe. SKIP EMPTY skips zero-highlight windows with the same output. OFF disables the effect. |
+| GRAIN | STOCK uses the recipe. OFF disables grain. |
+| COLOR CACHE | 4K, 8K, or 16K entries. Larger caches use extra working memory and can fall back to a smaller cache if allocation fails. Monochrome processing uses 4K. |
+
+The defaults are STOCK halation, STOCK grain and a 4K cache. Both effect
+switches apply to the main JPEG and its thumbnail. The `render` line in
+`FIND.TXT` reports the requested and actual cache settings.
 
 The output mode decides what happens to the camera's files:
 
@@ -77,9 +98,17 @@ The output mode decides what happens to the camera's files:
 
 Auto develop (off by default) develops each new shot a couple of seconds
 after you stop shooting, with the current film.
+Backlogs larger than 200 frames are processed in successive batches as the
+camera becomes idle. If the shooting folder cannot be scanned, auto develop
+keeps the backlog queued for the next attempt.
 
-Developed files carry `SOUP ENGINE - <film> #<frame>` in the EXIF Software tag,
-and are never developed twice: a frame can only be developed again from its RAW.
+Developed files record the source in EXIF Software. For example,
+`@0F4241/100EOS7D/IMG_` identifies `IMG_0001` in `100EOS7D`. The six hex
+digits encode `folder number × 10000 + frame number`. Canon-compatible
+filenames keep their four decimal digits. Older outputs in a shooting folder
+are still matched there. Older outputs in `ML/SOUP` with only a four-digit
+source number are kept on the card but cannot identify a source folder.
+A developed JPEG is never used as input again. Its RAW can be developed again.
 
 ### Speed
 
@@ -98,7 +127,14 @@ is all integer code.
 - If Canon later reuses a file number the module took, the module renames its
   own file at the next scan. Camera files are never renamed.
 - `ML/SOUP/FIND.TXT` logs the last develop job and `ML/SOUP/DIAG.TXT` any
-  stock or memory problems. Useful in bug reports.
+  stock or memory problems. A successful frame's `perf` line records
+  probe, thumbnail, streaming pipeline and commit timings in milliseconds,
+  plus the number of streaming seeks and bytes read from the card.
+- The `pipe` line splits `stream_ms` into decode, look, encode, CF read,
+  CF write and explicit task yield time. These elapsed times add up to
+  `stream_ms`. `look_ms` includes copying rows into the encoder's staging
+  buffer. `encode_ms` covers encoding the row groups and JPEG framing, with
+  CF writes counted separately.
 
 ## The stocks
 
@@ -126,10 +162,11 @@ cd port-7d
 make ML=/path/to/magic-lantern     # path without spaces
 ```
 
-`soup7d.c` is generated from `port-7d/parts/` (edit the parts, not soup7d.c):
+Edit the source in `port-7d/parts/`. `make` regenerates `soup7d.c` when a
+part changes. To regenerate the source on its own, run this in `port-7d`:
 
 ```bash
-cd port-7d/parts && cat head.c part_frames.c part_meta.c part_job.c part_gui.c tail.c > ../soup7d.c
+make soup7d.c
 ```
 
 Before putting a build on a camera, check that every symbol in
@@ -142,12 +179,14 @@ resident size; it is ~119 KB and growing it much risks Err 70.
 ### Tests
 
 Host tests run the module's real file-handling code against a fake ML API
-(`port-7d/tests/mlstub/`). They need your own 7D files (not included): a folder
-with a RAW+JPEG L pair.
+(`port-7d/tests/mlstub/`). `inplace-regression` needs a folder with your own
+7D RAW+JPEG L pair. The numbering and auto backlog tests generate their own
+fixtures.
 
 ```bash
 cd port-7d/tests; E=../../src/engine
 gcc -std=gnu99 -O1 -fsanitize=address,undefined numbering-regression.c -o /tmp/nr && /tmp/nr
+gcc -std=gnu99 -O1 -fsanitize=address,undefined -w -Imlstub -I$E auto-backlog-regression.c $E/se.c $E/cr2.c $E/jpeg_dec.c $E/jpeg_enc.c $E/look.c $E/stock.c $E/wb.c $E/color.c $E/grade.c $E/lut.c -lm -o /tmp/ar && /tmp/ar "$(mktemp -d)"
 gcc -std=gnu99 -O1 -fsanitize=address,undefined -w -Imlstub -I$E inplace-regression.c $E/se.c $E/cr2.c $E/jpeg_dec.c $E/jpeg_enc.c $E/look.c $E/stock.c $E/wb.c $E/color.c $E/grade.c $E/lut.c -lm -o /tmp/ir && /tmp/ir /path/to/7d-files "$PWD/../card/ML/FILM"
 ```
 

@@ -352,8 +352,16 @@ static void jo_bit_flush(se_jpeg *j)
 #define FIX_2_562915447  20995
 #define FIX_3_072711026  25172
 
-/* IJG jpeg_fdct_islow, in natural (row-major) order. */
-static void fdct(int32_t *d)
+/* Q16 reciprocal, round nearest with ties away from zero. A negative
+ * half-step needs one less unit of bias before the arithmetic shift.
+ * |v| < 2^15 after the DCT and r <= 8192, so the product fits in int32_t. */
+static inline int32_t quantize(int32_t v, int32_t r)
+{
+    return (v * r + 32768 + (v >> 31)) >> 16;
+}
+
+/* IJG jpeg_fdct_islow. Quantize each final coefficient before storing it. */
+static void transform_block(int32_t *d, const int32_t *recip)
 {
     int32_t tmp0, tmp1, tmp2, tmp3, tmp4, tmp5, tmp6, tmp7;
     int32_t tmp10, tmp11, tmp12, tmp13;
@@ -402,7 +410,7 @@ static void fdct(int32_t *d)
     }
 
     p = d;
-    for (i = 0; i < 8; i++, p++) {
+    for (i = 0; i < 8; i++, p++, recip++) {
         tmp0 = p[8 * 0] + p[8 * 7]; tmp7 = p[8 * 0] - p[8 * 7];
         tmp1 = p[8 * 1] + p[8 * 6]; tmp6 = p[8 * 1] - p[8 * 6];
         tmp2 = p[8 * 2] + p[8 * 5]; tmp5 = p[8 * 2] - p[8 * 5];
@@ -411,12 +419,12 @@ static void fdct(int32_t *d)
         tmp10 = tmp0 + tmp3; tmp13 = tmp0 - tmp3;
         tmp11 = tmp1 + tmp2; tmp12 = tmp1 - tmp2;
 
-        p[8 * 0] = DESCALE(tmp10 + tmp11, PASS1_BITS);
-        p[8 * 4] = DESCALE(tmp10 - tmp11, PASS1_BITS);
+        p[8 * 0] = quantize(DESCALE(tmp10 + tmp11, PASS1_BITS), recip[8 * 0]);
+        p[8 * 4] = quantize(DESCALE(tmp10 - tmp11, PASS1_BITS), recip[8 * 4]);
 
         z1 = (tmp12 + tmp13) * FIX_0_541196100;
-        p[8 * 2] = DESCALE(z1 + tmp13 * FIX_0_765366865, CONST_BITS + PASS1_BITS);
-        p[8 * 6] = DESCALE(z1 - tmp12 * FIX_1_847759065, CONST_BITS + PASS1_BITS);
+        p[8 * 2] = quantize(DESCALE(z1 + tmp13 * FIX_0_765366865, CONST_BITS + PASS1_BITS), recip[8 * 2]);
+        p[8 * 6] = quantize(DESCALE(z1 - tmp12 * FIX_1_847759065, CONST_BITS + PASS1_BITS), recip[8 * 6]);
 
         z1 = tmp4 + tmp7;
         z2 = tmp5 + tmp6;
@@ -435,10 +443,10 @@ static void fdct(int32_t *d)
 
         z3 += z5; z4 += z5;
 
-        p[8 * 7] = DESCALE(tmp4 + z1 + z3, CONST_BITS + PASS1_BITS);
-        p[8 * 5] = DESCALE(tmp5 + z2 + z4, CONST_BITS + PASS1_BITS);
-        p[8 * 3] = DESCALE(tmp6 + z2 + z3, CONST_BITS + PASS1_BITS);
-        p[8 * 1] = DESCALE(tmp7 + z1 + z4, CONST_BITS + PASS1_BITS);
+        p[8 * 7] = quantize(DESCALE(tmp4 + z1 + z3, CONST_BITS + PASS1_BITS), recip[8 * 7]);
+        p[8 * 5] = quantize(DESCALE(tmp5 + z2 + z4, CONST_BITS + PASS1_BITS), recip[8 * 5]);
+        p[8 * 3] = quantize(DESCALE(tmp6 + z2 + z3, CONST_BITS + PASS1_BITS), recip[8 * 3]);
+        p[8 * 1] = quantize(DESCALE(tmp7 + z1 + z4, CONST_BITS + PASS1_BITS), recip[8 * 1]);
     }
 }
 
@@ -453,17 +461,6 @@ static int magnitude(int v)
 }
 
 /*
- * Quantise: round(v / (8 q)) by reciprocal multiply, no hardware divider
- * here. 32-bit is enough: |v| < 2^15 out of the islow DCT and r <= 8192,
- * so |v| * r + 32768 < 2^29. (It was a 64-bit multiply and add.)
- */
-static inline int32_t quant(int32_t v, uint32_t r)
-{
-    if (v >= 0) return  (int32_t)(((uint32_t) v * r + 32768u) >> 16);
-    else        return -(int32_t)(((uint32_t)-v * r + 32768u) >> 16);
-}
-
-/*
  * A block's codes are collected as (length << 16 | bits) and written in one
  * loop at the end, with the bit buffer and output position on locals:
  * through j every field was loaded and stored again for every code, and a
@@ -474,18 +471,15 @@ static inline int32_t quant(int32_t v, uint32_t r)
  */
 #define QUEUE(code_, len_) (cq[nq++] = ((uint32_t)(len_) << 16) | (uint32_t)(code_))
 
-static void encode_block(se_jpeg *j, int32_t *blk, int qtbl, int comp,
+static void encode_block(se_jpeg *j, const int32_t *blk, int comp,
                          const uint32_t *dc, const uint32_t *ac)
 {
-    const uint32_t *qr = j->qrecip[qtbl], *qz = j->qzero[qtbl];
     uint32_t  cq[2 + 3 * 63 + 1], c;     /* DC, then per AC: ZRLs, code, bits */
     int       nq = 0, i, k, run, dcdiff, m;
     int32_t   q0;
 
-    fdct(blk);
-
     /* --- DC: differential against the previous block of this component -- */
-    q0 = quant(blk[0], qr[0]);
+    q0 = blk[0];
     dcdiff = q0 - j->dcpred[comp];
     j->dcpred[comp] = q0;
     m = magnitude(dcdiff);
@@ -494,15 +488,12 @@ static void encode_block(se_jpeg *j, int32_t *blk, int qtbl, int comp,
     if (m)
         QUEUE((uint32_t)(dcdiff < 0 ? dcdiff - 1 : dcdiff) & ((1u << m) - 1), m);
 
-    /* --- AC, in zig-zag order, quantised as they are reached ----------- */
+    /* --- AC, in zig-zag order ----------------------------------------- */
     run = 0;
     for (k = 1; k < 64; k++) {
         int     z = g_zigzag[k];
         int32_t v = blk[z];
-        /* |v| below the threshold quantises to 0: most of the high
-         * frequencies, now one compare instead of a multiply */
-        if ((uint32_t)(v + (int32_t)qz[z]) < 2 * qz[z] + 1) { run++; continue; }
-        v = quant(v, qr[z]);
+        if (v == 0) { run++; continue; }
         while (run > 15) {
             c = ac[0xf0];                       /* ZRL: 16 zeroes */
             QUEUE(c & 0xffff, c >> 16);
@@ -614,11 +605,8 @@ se_err se_jpeg_begin(se_jpeg *j, int width, int height, int quality,
          * jcdctmgr.c. Dividing by quantval alone overflows the Huffman
          * magnitude categories and desynchronises the whole stream.
          */
-        j->qrecip[0][i] = (uint32_t)((65536u + 4u * j->qt[0][i]) / (8u * j->qt[0][i]));
-        j->qrecip[1][i] = (uint32_t)((65536u + 4u * j->qt[1][i]) / (8u * j->qt[1][i]));
-        /* the largest |v| that quant() rounds to 0: |v| r + 32768 < 65536 */
-        j->qzero[0][i] = (32767u / j->qrecip[0][i]);
-        j->qzero[1][i] = (32767u / j->qrecip[1][i]);
+        j->qrecip[0][i] = (int32_t)((65536u + 4u * j->qt[0][i]) / (8u * j->qt[0][i]));
+        j->qrecip[1][i] = (int32_t)((65536u + 4u * j->qt[1][i]) / (8u * j->qt[1][i]));
     }
 
     /* SOI, then EXIF. A 50D file has no JFIF marker in front of it. */
@@ -667,53 +655,61 @@ se_err se_jpeg_begin(se_jpeg *j, int width, int height, int quality,
     return j->failed ? SE_E_IO : SE_OK;
 }
 
-/* Rec.601, level-shifted by -128. Cb and Cr are already signed. */
-#define Y_OF(r, g, b)  ((( 19595 * (r) + 38470 * (g) +  7471 * (b) + 32768) >> 16) - 128)
-#define CB_OF(r, g, b)  ((-11056 * (r) - 21712 * (g) + 32768 * (b) + 32768) >> 16)
-#define CR_OF(r, g, b)  (( 32768 * (r) - 27440 * (g) -  5328 * (b) + 32768) >> 16)
-
 /*
  * Two horizontally adjacent pixels: both lumas, and the 4:2:2 chroma as the
- * mean of the two pixels' own (rounded) chroma.
+ * mean of the two pixels' own (rounded) chroma. Subtract green first:
+ * the luma weights sum to 65536, and the chroma weights sum to zero.
  */
-static inline void yuv_pair(const uint8_t *p, const uint8_t *q,
-                            int32_t *y, int32_t *cb, int32_t *cr)
+static inline void yuv_pair(const uint8_t *p, int32_t *y, int32_t *cb, int32_t *cr)
 {
-    int r0 = p[0], g0 = p[1], b0 = p[2], r1 = q[0], g1 = q[1], b1 = q[2];
-    y[0] = Y_OF(r0, g0, b0);
-    y[1] = Y_OF(r1, g1, b1);
-    *cb  = (CB_OF(r0, g0, b0) + CB_OF(r1, g1, b1)) >> 1;
-    *cr  = (CR_OF(r0, g0, b0) + CR_OF(r1, g1, b1)) >> 1;
+    int g0 = p[1], g1 = p[4];
+    int r0 = p[0] - g0, r1 = p[3] - g1;
+    int b0 = p[2] - g0, b1 = p[5] - g1;
+    y[0] = g0 - 128 + ((19595 * r0 + 7471 * b0 + 32768) >> 16);
+    y[1] = g1 - 128 + ((19595 * r1 + 7471 * b1 + 32768) >> 16);
+    *cb = (((32768 * b0 - 11056 * r0 + 32768) >> 16) +
+           ((32768 * b1 - 11056 * r1 + 32768) >> 16)) >> 1;
+    *cr = (((32768 * r0 - 5328 * b0 + 32768) >> 16) +
+           ((32768 * r1 - 5328 * b1 + 32768) >> 16)) >> 1;
 }
 
-/* Encode the 8 rows currently held in j->strip as 16x8 MCUs. */
-static void encode_strip(se_jpeg *j)
+static void convert_mcu(const se_jpeg *j, int x0, int32_t blocks[4][64])
 {
-    int w = j->width;
-    int mcu, by, i;
-
-    for (mcu = 0; mcu * 16 < w; mcu++) {
-        int32_t Y[128], Cb[64], Cr[64];     /* Y: the left block, then the right */
-        int x0 = mcu * 16;
-
-        for (by = 0; by < 8; by++) {
-            const uint8_t *src = j->strip + (size_t)by * w * 3;
-            for (i = 0; i < 8; i++) {
-                int xa = x0 + 2 * i, xb = xa + 1;
-                int32_t *yo = Y + (i >> 2) * 64 + by * 8 + (i & 3) * 2;
-                /* at the right edge, columns past the width repeat the last */
-                if (xb >= w) { xb = w - 1; if (xa >= w) xa = w - 1; }
-                yuv_pair(src + xa * 3, src + xb * 3, yo, &Cb[by * 8 + i], &Cr[by * 8 + i]);
-            }
+    for (int by = 0; by < 8; by++) {
+        const uint8_t *src = j->strip + ((size_t)by * j->width + x0) * 3;
+        for (int i = 0; i < 8; i++) {
+            int32_t *yo = blocks[i >> 2] + by * 8 + (i & 3) * 2;
+            yuv_pair(src + i * 6, yo, &blocks[2][by * 8 + i], &blocks[3][by * 8 + i]);
         }
-
-        encode_block(j, Y,      0, 0, g_dc_lum, g_ac_lum);
-        encode_block(j, Y + 64, 0, 0, g_dc_lum, g_ac_lum);
-        encode_block(j, Cb, 1, 1, g_dc_chr, g_ac_chr);
-        encode_block(j, Cr, 1, 2, g_dc_chr, g_ac_chr);
     }
 }
 
+/* Group adjacent MCUs so reading the clock stays outside block/pixel loops. */
+static void encode_strip(se_jpeg *j)
+{
+    const int batch = sizeof j->mcu / sizeof j->mcu[0];
+    int mcus = j->width / 16;
+    for (int first = 0; first < mcus; first += batch) {
+        int count = SE_MIN(batch, mcus - first);
+        if (j->mark_phase) j->mark_phase(j->ctx, SE_JPEG_COLOR);
+        for (int i = 0; i < count; i++)
+            convert_mcu(j, (first + i) * 16, j->mcu[i]);
+
+        if (j->mark_phase) j->mark_phase(j->ctx, SE_JPEG_TRANSFORM);
+        for (int i = 0; i < count; i++)
+            for (int b = 0; b < 4; b++)
+                transform_block(j->mcu[i][b], j->qrecip[b >= 2]);
+
+        if (j->mark_phase) j->mark_phase(j->ctx, SE_JPEG_ENTROPY);
+        for (int i = 0; i < count; i++) {
+            encode_block(j, j->mcu[i][0], 0, g_dc_lum, g_ac_lum);
+            encode_block(j, j->mcu[i][1], 0, g_dc_lum, g_ac_lum);
+            encode_block(j, j->mcu[i][2], 1, g_dc_chr, g_ac_chr);
+            encode_block(j, j->mcu[i][3], 2, g_dc_chr, g_ac_chr);
+        }
+    }
+    if (j->mark_phase) j->mark_phase(j->ctx, SE_JPEG_OTHER);
+}
 
 se_err se_jpeg_write_rows(se_jpeg *j, const uint8_t *rgb, int nrows)
 {

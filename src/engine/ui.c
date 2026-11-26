@@ -22,10 +22,23 @@ void se_ui_clear(se_ui_fb *fb, uint8_t c)
 
 void se_ui_fill(se_ui_fb *fb, int x, int y, int w, int h, uint8_t c)
 {
-    int i, j;
-    for (j = 0; j < h; j++)
-        for (i = 0; i < w; i++)
-            se_ui_px(fb, x + i, y + j, c);
+    int left = SE_MAX(x, 0), right = SE_MIN(x + w, SE_UI_W);
+    int top = SE_MAX(y, 0), bottom = SE_MIN(y + h, SE_UI_H);
+    int first_byte, whole_bytes, row;
+    uint8_t pair = (c & 15) * 17;
+
+    if (left >= right || top >= bottom) return;
+    first_byte = (left + 1) / 2;
+    whole_bytes = right / 2 - first_byte;
+
+    for (row = top; row < bottom; row++) {
+        uint8_t *dst = fb->px + row * SE_UI_PITCH;
+        /* A partial byte shares its other pixel with the background. */
+        if (left & 1) dst[left / 2] = (dst[left / 2] & 15) | (pair & 240);
+        if (whole_bytes == 1) dst[first_byte] = pair;
+        else if (whole_bytes > 1) memset(dst + first_byte, pair, whole_bytes);
+        if (right & 1) dst[right / 2] = (dst[right / 2] & 240) | (pair & 15);
+    }
 }
 
 void se_ui_frame(se_ui_fb *fb, int x, int y, int w, int h, uint8_t c)
@@ -177,6 +190,7 @@ void se_ui_init(se_ui *u)
     memset(u, 0, sizeof *u);
     u->screen = SE_SCREEN_STOCK;
     u->stock  = 0;
+    u->stock_leader_colour = SE_C_RUST;
     u->value[SE_SET_SOURCE] = SE_SOURCE_PREVIEW;
     u->value[SE_SET_RES]    = 1;   /* HALF while we are testing */
     u->value[SE_SET_GRAIN]  = 1;
@@ -271,17 +285,13 @@ static void plate(se_ui_fb *fb, int x, int y, int w, int h,
     se_ui_fill(fb, x + w - 2, y + h - 1, 2, 1, ground);
 }
 
-/* Is this a light colour? Sixteen fixed colours, so a list, not a sum. */
+/* Wrapper colours that need dark print in the 7D palette. */
 static int is_light(uint8_t c)
 {
     return c == SE_C_HILITE || c == SE_C_PAPER || c == SE_C_EDGE ||
-           c == SE_C_GOLD   || c == SE_C_AMBER || c == SE_C_WHITE;
+           c == SE_C_GOLD   || c == SE_C_AMBER || c == SE_C_WHITE ||
+           c == SE_C_MID    || c == SE_C_TEAL;
 }
-static uint8_t on(uint8_t ground)
-{
-    return is_light(ground) ? SE_C_INK : SE_C_HILITE;
-}
-
 /* ------------------------------------------------------ chrome: bars */
 
 static void header(se_ui_fb *fb, const char *title, const char *right)
@@ -329,20 +339,6 @@ static void footer(se_ui_fb *fb, const char *hints)
 }
 
 /*
- * The one piece of colour: a band with the film speed in it.
- *
- * It is what tells the stocks apart without reading, and it is the only
- * thing on the screen that is not type. One band, one colour, centred
- * under the name.
- */
-static void speed_band(se_ui_fb *fb, int y, uint8_t accent, const char *iso)
-{
-    const int w = 300, x = (SE_UI_W - w) / 2;
-    plate(fb, x, y, w, 26, accent, SE_C_INK, SE_C_PAPER);
-    se_ui_text_c(fb, SE_UI_W / 2, y + 6, iso, on(accent), 3, 2);
-}
-
-/*
  * The name, set as large as it will go.
  *
  * Scale is chosen to fit rather than fixed, so CINE is not dwarfed and
@@ -376,56 +372,50 @@ static int name_is(const char *name, const char *want)
     return 1;
 }
 
-typedef struct { uint8_t accent; const char *iso; } se_stock_look;
+typedef struct {
+    uint8_t accent;
+    const char *speed;
+    const char *short_name;
+    const char *label;
+    const char *code;           /* overrides the speed on the canister */
+} se_stock_look;
 
 /*
- * The number on the band is the FILM's rated speed -- Velvia is a 50,
+ * FILM SPEED is the film's rated speed -- Velvia is a 50,
  * Portra a 400 -- and nothing else. The engine never touches the camera's
  * ISO, and must not: Canon's exposure settings are properties, and writing
  * a property is forbidden here because they live in NVRAM.
  *
- * So the band says "FILM SPEED 50" rather than "ISO 50". The same number,
- * and no way to read it as something the camera is about to do.
- */
-/*
- * name_is() matches a PREFIX, so order and length both matter here.
- * "CLASSIC" would make the two Classics indistinguishable -- hence
- * "CLASSIC CH" and "CLASSIC N".
- * A stock with no entry gets a hashed accent and 200, which is fine for a
- * stock someone drops on the card but not for one that ships.
+ * Match the complete stock name so a custom variant keeps its own name.
  */
 static const struct { const char *key; se_stock_look lk; } g_looks[] = {
-    /* experimental stocks added for the 7D port; longer keys before the
-     * shorter ones they share a prefix with ("PORTRA 160" before "PORTRA") */
-    { "PORTRA 160", { SE_C_AMBER,  "FILM SPEED 160" } },
-    { "PORTRA 800", { SE_C_AMBER,  "FILM SPEED 800" } },
-    { "EKTAR",      { SE_C_RED,    "FILM SPEED 100" } },
-    { "SUPERIA",    { SE_C_OLIVE,  "FILM SPEED 400" } },
-    { "ULTRAMAX",   { SE_C_GOLD,   "FILM SPEED 400" } },
-    { "PRO 400H",   { SE_C_TEAL,   "FILM SPEED 400" } },
-    { "VISION3 250",{ SE_C_TEAL,   "FILM SPEED 250" } },
-    { "VISION3 500",{ SE_C_PLUM,   "FILM SPEED 500" } },
-    { "EKTACHROME", { SE_C_TEAL,   "FILM SPEED 100" } },
-    { "KODACHROME", { SE_C_RED,    "FILM SPEED 64"  } },
-    { "HP5",        { SE_C_INK,    "FILM SPEED 400" } },
-    { "TRI-X",      { SE_C_INK,    "FILM SPEED 400" } },
-    { "T-MAX",      { SE_C_SHADOW, "FILM SPEED 400" } },
-    { "DELTA 3200", { SE_C_INK,    "FILM SPEED 3200"} },
-    /* the Fujifilm simulations */
-    { "PROVIA",     { SE_C_SLATE,  "FILM SPEED 100" } },
-    { "VELVIA",     { SE_C_OLIVE,  "FILM SPEED 50"  } },
-    { "ASTIA",      { SE_C_PLUM,   "FILM SPEED 100" } },
-    { "CLASSIC CH", { SE_C_MID,    "FILM SPEED 200" } },
-    { "CLASSIC N",  { SE_C_TEAL,   "FILM SPEED 400" } },
-    { "NOSTALGIC",  { SE_C_RUST,   "FILM SPEED 400" } },
-    { "ETERNA",     { SE_C_EDGE,   "FILM SPEED 250" } },
-    { "BLEACH",     { SE_C_SHADOW, "FILM SPEED 400" } },
-    { "ACROS",      { SE_C_INK,    "FILM SPEED 100" } },
-    { "REALA",      { SE_C_HILITE, "FILM SPEED 100" } },
-    /* and the few that are not Fuji */
-    { "SOUP 800",   { SE_C_RED,    "FILM SPEED 800" } },
-    { "GOLD",       { SE_C_GOLD,   "FILM SPEED 200" } },
-    { "PORTRA",     { SE_C_AMBER,  "FILM SPEED 400" } },
+    { "PORTRA 160",      { SE_C_AMBER,  "160",  "P160",      "PORTRA", NULL } },
+    { "PORTRA 800",      { SE_C_AMBER,  "800",  "P800",      "PORTRA", NULL } },
+    { "EKTAR 100",       { SE_C_RED,    "100",  "EKT 100",   "EKTAR", NULL } },
+    { "SUPERIA 400",     { SE_C_OLIVE,  "400",  "SUP 400",   "SUP", NULL } },
+    { "ULTRAMAX 400",    { SE_C_GOLD,   "400",  "UMX 400",   "UMX", NULL } },
+    { "PRO 400H",        { SE_C_TEAL,   "400",  "400H",      "PRO",    "400H" } },
+    { "VISION3 250D",    { SE_C_TEAL,   "250",  "V3 250D",   "V3",     "250D" } },
+    { "VISION3 500T",    { SE_C_PLUM,   "500",  "V3 500T",   "V3",     "500T" } },
+    { "EKTACHROME E100", { SE_C_TEAL,   "100",  "E100",      "EKTCH",  "E100" } },
+    { "KODACHROME 64",   { SE_C_RED,    "64",   "K64",       "KCHRM", NULL } },
+    { "HP5 PLUS",        { SE_C_INK,    "400",  "HP5+",      "HP5+", NULL } },
+    { "TRI-X 400",       { SE_C_INK,    "400",  "TRI-X",     "TRI-X", NULL } },
+    { "T-MAX 400",       { SE_C_SHADOW, "400",  "TMY",       "TMY", NULL } },
+    { "DELTA 3200",      { SE_C_INK,    "3200", "D3200",     "DELTA", NULL } },
+    { "PROVIA",          { SE_C_SLATE,  "100",  "PROVIA",    "PROVIA", NULL } },
+    { "VELVIA",          { SE_C_OLIVE,  "50",   "VELVIA",    "VELVIA", NULL } },
+    { "ASTIA",           { SE_C_PLUM,   "100",  "ASTIA",     "ASTIA", NULL } },
+    { "CLASSIC CHROME",  { SE_C_MID,    "200",  "CL CHROME", "CL CH", NULL } },
+    { "CLASSIC NEG",     { SE_C_TEAL,   "400",  "CL NEG",    "CL NEG", NULL } },
+    { "NOSTALGIC NEG",   { SE_C_RUST,   "400",  "NOST NEG",  "NOST", NULL } },
+    { "ETERNA",          { SE_C_EDGE,   "250",  "ETERNA",    "ETERNA", NULL } },
+    { "BLEACH BYPASS",   { SE_C_SHADOW, "400",  "BLEACH",    "BLEACH", NULL } },
+    { "ACROS",           { SE_C_INK,    "100",  "ACROS",     "ACROS", NULL } },
+    { "REALA ACE",       { SE_C_HILITE, "100",  "R ACE",     "R ACE", NULL } },
+    { "SOUP 800",        { SE_C_RED,    "800",  "SOUP 800",  "SOUP", NULL } },
+    { "GOLD",            { SE_C_GOLD,   "200",  "GOLD",      "GOLD", NULL } },
+    { "PORTRA",          { SE_C_AMBER,  "400",  "P400",      "PORTRA", NULL } },
 };
 #define SE_NLOOKS ((int)(sizeof g_looks / sizeof g_looks[0]))
 
@@ -440,11 +430,15 @@ static se_stock_look stock_look(const char *name)
 
     if (!name) name = "?";
     for (i = 0; i < SE_NLOOKS; i++)
-        if (name_is(name, g_looks[i].key)) return g_looks[i].lk;
+        if (name_is(name, g_looks[i].key) && !name[strlen(g_looks[i].key)])
+            return g_looks[i].lk;
 
     for (i = 0; name[i]; i++) h = (h ^ (unsigned char)name[i]) * 16777619u;
     lk.accent = pick[h % 7u];
-    lk.iso    = "FILM SPEED 200";
+    lk.speed = "200";
+    lk.short_name = name;
+    lk.label = 0;
+    lk.code = 0;
     return lk;
 }
 
@@ -587,6 +581,136 @@ static void draw_roll(se_ui_fb *fb, int x, int y, int s, const se_roll *r)
     }
 }
 
+enum {
+    CANISTER_WIDTH = 188, CANISTER_AXIS = 132,
+    CANISTER_RADIUS = 55, CANISTER_CAP_DEPTH = 10,
+    CANISTER_LEADER_WIDTH = 60
+};
+
+/* Print counterclockwise. Slightly widen the dots across the label. */
+static void draw_axial_text(se_ui_fb *fb, int cx, int cy, const char *line,
+                            uint8_t colour)
+{
+    const int dot_width = 3;
+    int y = cy + se_ui_text_w(line, 1) / 2;
+
+    for (; *line; line++, y -= SE_FONT_W + 1) {
+        const uint8_t *glyph = se_ui_font[glyph_index((unsigned char)*line)];
+        int col, row;
+        for (col = 0; col < SE_FONT_W; col++)
+            for (row = 0; row < SE_FONT_H; row++)
+                if (glyph[col] & (1u << row))
+                    se_ui_fill(fb, cx + dot_width * row - SE_FONT_H * dot_width / 2,
+                               y - col, dot_width, 1, colour);
+    }
+}
+
+/* Draw the cap and spindle on individual framebuffer rows. */
+static void canister_oval(se_ui_fb *fb, int x, int y, int rx, int ry,
+                          uint8_t colour)
+{
+    int half = rx, dx_squared = rx * rx, dy_squared = ry * ry;
+    int limit = dx_squared * dy_squared;
+    int dy;
+
+    for (dy = 0; dy <= ry; dy++) {
+        while (half * half * dy_squared + dy * dy * dx_squared > limit)
+            half--;
+        se_ui_fill(fb, x - half, y - dy, 2 * half + 1, 1, colour);
+        if (dy)
+            se_ui_fill(fb, x - half, y + dy, 2 * half + 1, 1, colour);
+    }
+}
+
+/* Front half of the same ellipse used to draw both metal end caps. */
+static int canister_front_arc(int dx)
+{
+    const int radius_sq = CANISTER_RADIUS * CANISTER_RADIUS;
+    const int depth_sq = CANISTER_CAP_DEPTH * CANISTER_CAP_DEPTH;
+    int available = (radius_sq - dx * dx) * depth_sq;
+    int arc = CANISTER_CAP_DEPTH;
+
+    while (arc * arc * radius_sq > available) arc--;
+    return arc;
+}
+
+static void draw_leader_perforation(se_ui_fb *fb, int x, int y, int right)
+{
+    se_ui_fill(fb, x, y + 1, SE_MIN(8, right - x), 2, SE_C_PAPER);
+    se_ui_fill(fb, x + 1, y, SE_MIN(6, right - x - 1), 4, SE_C_PAPER);
+}
+
+static void draw_film_leader(se_ui_fb *fb, int x, int y, int inset, uint8_t colour)
+{
+    const int right = x + CANISTER_LEADER_WIDTH;
+    int row, hole;
+
+    if (inset >= CANISTER_LEADER_WIDTH) return;
+    x += inset;
+    /* Move the taper and perforations together under the stationary outlet. */
+    for (row = 0; row < 50; row++) {
+        int left = x + SE_MAX(0, row - 13);
+        se_ui_fill(fb, left, y + 16 + row, right - left, 1, colour);
+    }
+    for (hole = 8; hole <= 50; hole += 12)
+        draw_leader_perforation(fb, x + hole, y + 20, right);
+    for (hole = 39; hole <= 51; hole += 12)
+        draw_leader_perforation(fb, x + hole, y + 59, right);
+}
+
+/* A 35 mm cartridge with the wrapper continuing onto the tangent lip. */
+static void draw_canister(se_ui_fb *fb, int x, int y, const se_roll *r,
+                          const se_stock_look *look, int leader_inset, uint8_t leader_colour)
+{
+    uint8_t body = r->shape_body & 15;
+    uint8_t band = r->band_label >> 4;
+    uint8_t ink = is_light(body) ? SE_C_INK : SE_C_HILITE;
+    int axis_x = x + CANISTER_AXIS;
+    int label_y = y + 44;
+    int col;
+
+    draw_film_leader(fb, x, y, leader_inset, leader_colour);
+    canister_oval(fb, axis_x, y + 71, CANISTER_RADIUS, CANISTER_CAP_DEPTH, SE_C_INK);
+
+    /* The label follows the projected cylinder. The outlet continues the
+     * label from the left tangent, with no seam through the colour bands. */
+    se_ui_fill(fb, x + 55, y + 15, 3, 55, SE_C_INK);
+    for (col = 58; col < CANISTER_WIDTH - 2; col += 2) {
+        int arc = canister_front_arc(SE_MAX(col, 86) - CANISTER_AXIS);
+        int top = y + 10 + arc;
+        int left = x + col;
+        uint8_t shade = col >= 178 ? DARK(body) : body;
+
+        se_ui_fill(fb, left, top, 2, 55, SE_C_INK);
+        se_ui_fill(fb, left, top + 1, 2, 53, band);
+        se_ui_fill(fb, left, top + 7, 2, 39, shade);
+        if (col >= CANISTER_AXIS - CANISTER_RADIUS) {
+            uint8_t rim = col < 86 || col >= 178 ? SE_C_MID : SE_C_EDGE;
+            se_ui_fill(fb, left, top + 55, 2, 5, rim);
+        }
+    }
+    se_ui_fill(fb, x + CANISTER_WIDTH - 2, y + 10, 2, 62, SE_C_INK);
+
+    /* The hub is a shallow ring above the metal cap, with a dark bore. */
+    canister_oval(fb, axis_x, y + 10, CANISTER_RADIUS, CANISTER_CAP_DEPTH, SE_C_INK);
+    canister_oval(fb, axis_x, y + 11, 52, 8, SE_C_SLATE);
+    canister_oval(fb, axis_x, y + 8, 51, 8, SE_C_EDGE);
+    canister_oval(fb, axis_x, y + 8, 48, 7, SE_C_HILITE);
+    canister_oval(fb, axis_x, y + 7, 44, 6, SE_C_MID);
+    canister_oval(fb, axis_x, y + 8, 22, 6, SE_C_SHADOW);
+    canister_oval(fb, axis_x, y + 6, 21, 6, SE_C_INK);
+    canister_oval(fb, axis_x, y + 5, 18, 4, SE_C_SLATE);
+    canister_oval(fb, axis_x, y + 5, 13, 3, SE_C_INK);
+
+    if (look->label) {
+        draw_axial_text(fb, axis_x - 13, label_y, look->label, ink);
+        draw_axial_text(fb, axis_x + 13, label_y,
+                         look->code ? look->code : look->speed, ink);
+    } else {
+        draw_axial_text(fb, axis_x, label_y, "35MM", ink);
+    }
+}
+
 /* A favourite's star, stuck on the roll's top-right corner: gold, with
  * an ink outline so it reads over any canister colour. 9x9 sprite pixels. */
 static const uint16_t g_star[9] = {          /* bit 8 = leftmost column */
@@ -635,16 +759,92 @@ static void roll_and_name(se_ui_fb *fb, int y, const char *nm, uint8_t ink,
     se_ui_text(fb, x0 + iw + gap, y, nm, ink, sx, sy);
 }
 
+typedef struct {
+    se_stock_look look;
+    char speed[20];
+    int width;
+} se_stock_label;
+
+enum { STOCK_ART_Y = SE_UI_STOCK_ART_TOP + 2, STOCK_LABEL_GAP = 18, STOCK_SIDE_MARGIN = 48 };
+
+static void stock_label_init(se_stock_label *label, const se_ui_stock *stock)
+{
+    label->look = stock_look(stock->name);
+    put_str(put_str(label->speed, "FILM SPEED "), label->look.speed);
+    label->width = CANISTER_WIDTH + STOCK_LABEL_GAP +
+                   SE_MAX(se_ui_text_w(label->look.short_name, 3),
+                          se_ui_text_w(label->speed, 2) + 12);
+}
+
+static void draw_stock_label(se_ui_fb *fb, const se_ui_stock *stock,
+                             const se_stock_label *label, int offset, int leader_inset,
+                             uint8_t leader_colour)
+{
+    const int y = STOCK_ART_Y, s = 2;
+    int x = (SE_UI_W - label->width) / 2 + offset;
+    int label_x = x + CANISTER_WIDTH + STOCK_LABEL_GAP;
+
+    draw_canister(fb, x, y, stock_roll(stock->name), &label->look, leader_inset, leader_colour);
+    if (stock->fav) draw_star(fb, x + CANISTER_WIDTH - SE_SPR_W * 2 * s, y, s);
+    se_ui_text(fb, label_x, 73, label->look.short_name, SE_C_INK, 3, 2);
+    se_ui_fill(fb, label_x, 97, 5, SE_FONT_H, label->look.accent);
+    se_ui_text(fb, label_x + 12, 97, label->speed, SE_C_SLATE, 2, 1);
+}
+
+static void draw_stock_selection(const se_ui *u, se_ui_fb *fb, int cur)
+{
+    int from = u->stock_slide_from;
+    int leader_inset = (CANISTER_LEADER_WIDTH * u->stock_leader_retract + 128) / 256;
+    uint8_t leader_colour = u->stock_leader_colour;
+    se_stock_label current;
+
+    stock_label_init(&current, &u->stocks[cur]);
+    if (u->stock_slide && from >= 0 && from < u->nstocks && from != cur) {
+        const int margin = STOCK_SIDE_MARGIN / 2;  /* two pixels per byte */
+        const int paper = SE_C_PAPER | (SE_C_PAPER << 4);
+        se_stock_label outgoing;
+        int spacing, offset, y;
+
+        stock_label_init(&outgoing, &u->stocks[from]);
+        spacing = SE_UI_W / 2 - STOCK_SIDE_MARGIN +
+                  (SE_MAX(current.width, outgoing.width) + 1) / 2 + 16;
+        offset = spacing * u->stock_slide / 256;
+        if (u->stock_slide < 0) spacing = -spacing;
+        draw_stock_label(fb, &u->stocks[from], &outgoing, offset - spacing, leader_inset, leader_colour);
+        draw_stock_label(fb, &u->stocks[cur], &current, offset, leader_inset, leader_colour);
+
+        /* Keep the arrows and their gutters outside the sliding artwork. */
+        for (y = SE_UI_STOCK_ART_TOP; y < SE_UI_STOCK_ART_TOP + SE_UI_STOCK_ART_ROWS; y++) {
+            uint8_t *row = fb->px + y * SE_UI_PITCH;
+            memset(row, paper, margin);
+            memset(row + SE_UI_PITCH - margin, paper, margin);
+        }
+    } else {
+        draw_stock_label(fb, &u->stocks[cur], &current, 0, leader_inset, leader_colour);
+    }
+}
+
+static void draw_stock_art(const se_ui *u, se_ui_fb *fb, int cur)
+{
+    draw_stock_selection(u, fb, cur);
+    if (u->nstocks > 1) {
+        se_ui_text(fb, 16, 114, SE_SYM_LEFT, SE_C_MID, 3, 2);
+        se_ui_text(fb, SE_UI_W - 32, 114, SE_SYM_RIGHT, SE_C_MID, 3, 2);
+    }
+}
+
+void se_ui_redraw_stock_art(const se_ui *u, se_ui_fb *fb)
+{
+    const int paper = SE_C_PAPER | (SE_C_PAPER << 4);
+    int n = u->nstocks;
+
+    if (n <= 0) return;
+    memset(fb->px + SE_UI_STOCK_ART_TOP * SE_UI_PITCH, paper,
+           SE_UI_STOCK_ART_ROWS * SE_UI_PITCH);
+    draw_stock_art(u, fb, (u->stock % n + n) % n);
+}
+
 /* --------------------------------------------------------- the screens */
-/*
- * The stock screen, and it is one thing: the name of the film you are
- * about to shoot, as large as the panel will carry.
- *
- * Everything else is support. The neighbours are named small and grey at
- * the margins so the wheel has somewhere to go; the band under the name
- * carries the speed and the colour; the line under that is what the stock
- * does, in the stock's own words.
- */
 static void draw_stock(const se_ui *u, se_ui_fb *fb)
 {
     int n = u->nstocks, i, cur = 0;
@@ -678,28 +878,7 @@ static void draw_stock(const se_ui *u, se_ui_fb *fb)
     put_int(d, n);
     header(fb, "SOUP", buf);
 
-    /*
-     * Arrows at the margins, and nothing else.
-     *
-     * The neighbouring stocks used to be named here. With thirteen on the
-     * card that is three film names across one line, and the eye cannot
-     * tell at a glance which of the three it is meant to be reading. The
-     * arrows alone say the wheel does something; the ticks below say where
-     * in the list you are.
-     */
-    if (n > 1) {
-        se_ui_text(fb, 16, 114, SE_SYM_LEFT, SE_C_MID, 3, 2);
-        se_ui_text(fb, SE_UI_W - 32, 114, SE_SYM_RIGHT, SE_C_MID, 3, 2);
-    }
-
-    /* the icon and the name as one centred unit, then the band of colour */
-    {
-        const char *nm = u->stocks[cur].name ? u->stocks[cur].name : "?";
-        se_stock_look lk = stock_look(u->stocks[cur].name);
-
-        roll_and_name(fb, 54, nm, SE_C_INK, u->stocks[cur].fav);
-        speed_band(fb, 108, lk.accent, lk.iso);
-    }
+    draw_stock_art(u, fb, cur);
 
     /* what the stock does, in its own words, up to the first colon */
     d = buf;

@@ -15,16 +15,17 @@ struct card_info { int file_number; };
 static volatile int stop_worker,busy,gui_running; static int ml_shutdown_requested;
 static const char *dcim_list[64], *soup_list[16]; static int open_dirs; static struct card_info card;
 static struct fio_dirent dirs[4];
-static const char *get_dcim_dir(void){ return "A:/DCIM/100EOS7D"; }
+static const char *test_dir="A:/DCIM/100EOS7D";
+static const char *get_dcim_dir(void){ return test_dir; }
 static struct card_info *get_shooting_card(void){ return &card; }
 /* directory listing comes from the memfile table so renames show up */
 #include "ml-file-stubs.h"
 static const char *names_d[64], *names_s[64];
 static void relist(void){
-  int a=0,b=0;
+  int a=0,b=0;size_t len=strlen(test_dir);
   for(int i=0;i<nmfs;i++){
     const char *p=mfs[i].path;
-    if(!strncmp(p,"A:/DCIM/100EOS7D/",17)) names_d[a++]=p+17;
+    if(!strncmp(p,test_dir,len)&&p[len]=='/') names_d[a++]=p+len+1;
     else if(!strncmp(p,"ML/SOUP/",8)) names_s[b++]=p+8;
   }
   names_d[a]=0; names_s[b]=0;
@@ -33,7 +34,7 @@ static int fill(struct fio_dirent *d,struct fio_file *f){ if(!d->l[d->i])return 
   snprintf(f->name,sizeof f->name,"%s",d->l[d->i++]); return 0; }
 static struct fio_dirent *FIO_FindFirstEx(const char *dir,struct fio_file *f){
   relist();
-  const char **l=!strcmp(dir,"A:/DCIM/100EOS7D")?names_d:!strcmp(dir,"ML/SOUP")?names_s:0;
+  const char **l=!strcmp(dir,test_dir)?names_d:!strcmp(dir,"ML/SOUP")?names_s:0;
   if(!l)return (struct fio_dirent*)1; struct fio_dirent *d=&dirs[open_dirs++]; d->i=0; d->l=l;
   if(fill(d,f))memset(f,0,sizeof *f); return d; }
 static int FIO_FindNextEx(struct fio_dirent *d,struct fio_file *f){ return fill(d,f); }
@@ -43,7 +44,7 @@ static void FIO_FindClose(struct fio_dirent *d){ (void)d; open_dirs--; }
 #define D "A:/DCIM/100EOS7D/"
 static int done(int n){ int i=frame_lookup(n); return i>=0?frames[i].done:-1; }
 int main(void){
-  char o[96],t[96]; int n;
+  char o[96],t[96],tag[96],tag_second[96]; int n;
   /* Canon frames 0525..0530 (+ old _MG_0001); legacy output SOUP0526 (no #);
    * new-style SOUP0531 made from 0527; ML/SOUP output SOUP0003 made from 0529 */
   mf_add(D"_MG_0001.CR2",0);
@@ -51,7 +52,7 @@ int main(void){
   mf_add(D"_B7D0526.JPG",0); mf_add(D"SOUP0526.JPG","xxSOUP ENGINE - GOLD\0yy");
   mf_add(D"_B7D0527.JPG",0); mf_add(D"_B7D0528.JPG",0); mf_add(D"_B7D0529.CR2",0); mf_add(D"_B7D0530.JPG",0);
   mf_add(D"SOUP0531.JPG","\xff\xd8 exif... SOUP ENGINE - PORTRA 160 #0527\0 more");
-  mf_add("ML/SOUP/SOUP0003.JPG","SOUP ENGINE - HP5 PLUS #0529\0");
+  mf_add("ML/SOUP/SOUP0003.JPG","SOUP ENGINE @0F4451/100EOS7D/_B7D - HP5 PLUS #0529");
   card.file_number=530;
   assert(index_build()==0&&open_dirs==0);
   assert(nframes==7);                              /* outputs are not frames */
@@ -99,5 +100,29 @@ int main(void){
   { uint8_t b[64]; assert(soup_marked(D"_B7D0545.JPG",b,64)==1&&soup_marked(D"_B7D0546.JPG",b,64)==0); }
   /* 9999 reached */
   card.file_number=9999; assert(index_build()==0); assert(next_output(0,o,t,sizeof o)==-1);
+  /* Old flat-folder outputs cannot prove their directory. New tags must
+   * match the entire folder name and one of the source file prefixes. */
+  mf_add("ML/SOUP/SOUP0004.JPG","SOUP ENGINE - GOLD #0529");
+  mf_add("A:/DCIM/101EOS7D/_B7D0529.CR2",0);
+  mf_add("A:/DCIM/101EOS7D/_B7D0530.JPG",0);
+  test_dir="A:/DCIM/101EOS7D";card.file_number=530;
+  assert(index_build()==0&&done(529)==0);
+  { uint16_t sel[2]; assert(select_new(sel,2)==1&&sel[0]==530); }
+  format_source_tag(tag,sizeof tag,"GOLD","_B7D",529);
+  mf_add("ML/SOUP/SOUP0005.JPG",tag);
+  assert(index_build()==0&&done(529)==1&&done(530)==0);
+  test_dir="A:/DCIM/101OTHER";mf_add("A:/DCIM/101OTHER/_B7D0529.CR2",0);
+  assert(index_build()==0&&done(529)==0);
+  format_source_tag(tag_second,sizeof tag_second,"GOLD","IMG_",529);
+  mf_add("ML/SOUP/SOUP0006.JPG",tag_second);
+  assert(index_build()==0&&done(529)==0);
+  /* A malformed qualified tag cannot fall back to its legacy number. */
+  mf_add("A:/DCIM/101OTHER/SOUP0529.JPG","SOUP ENGINE @FFFFFF/101OTHER/_B7D - GOLD #0529");
+  assert(index_build()==0&&done(529)==0);
+  test_dir="A:/DCIM/999EOS7D";
+  assert(index_build()==0);
+  format_source_tag(tag,sizeof tag,"GOLD","IMG_",9999);
+  assert(!strcmp(tag,"SOUP ENGINE @98967F/999EOS7D/IMG_ - GOLD #9999"));
+  frames_release();
   puts("numbering-regression: all checks passed"); return 0;
 }

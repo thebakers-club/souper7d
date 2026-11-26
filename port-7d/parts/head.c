@@ -74,6 +74,10 @@ enum {M_ONE, M_INPLACE, M_NEW, M_NEWDEL, M_MLSOUP, M_COUNT};
 static int set_mode=M_ONE;
 static int set_auto=0;         /* develop each new shot in the background */
 static int set_lastn=2;        /* index into lastn_choices: 5 */
+enum { HALATION_STOCK, HALATION_SKIP_EMPTY, HALATION_OFF, HALATION_COUNT };
+typedef struct { int halation, grain, cache; } render_settings;
+static render_settings set_render = { HALATION_STOCK, 1, SE_LOOK_CACHE_4K };
+static render_settings job_render;
 static int job_scale=2, job_mode=M_ONE;
 /* derived from job_mode for the new-file modes */
 static int job_delete=0;       /* NEW FILE + DELETE RAW */
@@ -210,6 +214,9 @@ static void load_cfg(void)
         if(!strncmp(t+i,"mode=",5)&&t[i+5]>='0'&&t[i+5]<'0'+M_COUNT)set_mode=t[i+5]-'0';
         if(!strncmp(t+i,"auto=",5)&&(t[i+5]=='0'||t[i+5]=='1'))set_auto=t[i+5]-'0';
         if(!strncmp(t+i,"lastn=",6)&&t[i+6]>='0'&&t[i+6]<='4')set_lastn=t[i+6]-'0';
+        if(!strncmp(t+i,"halation=",9)&&t[i+9]>='0'&&t[i+9]<'0'+HALATION_COUNT)set_render.halation=t[i+9]-'0';
+        if(!strncmp(t+i,"grain=",6)&&(t[i+6]=='0'||t[i+6]=='1'))set_render.grain=t[i+6]-'0';
+        if(!strncmp(t+i,"cache=",6)&&t[i+6]>='0'&&t[i+6]<'0'+SE_LOOK_CACHE_COUNT)set_render.cache=t[i+6]-'0';
         if(!strncmp(t+i,"film=",5)){
             char nm[16];int j=0;
             for(k=i+5;j<15&&t[k]&&t[k]!='\r'&&t[k]!='\n';k++)nm[j++]=t[k];
@@ -243,7 +250,9 @@ static void save_cfg(void)
 {
     char t[640];int i,n;
     /* lengths by strlen: Canon's snprintf is not trusted beyond the text */
-    snprintf(t,sizeof(t),"res=%d\r\nmode=%d\r\nauto=%d\r\nlastn=%d\r\nfilm=%s\r\nfav=",set_res,set_mode,set_auto,set_lastn,
+    snprintf(t,sizeof(t),
+        "res=%d\r\nmode=%d\r\nauto=%d\r\nlastn=%d\r\nhalation=%d\r\ngrain=%d\r\ncache=%d\r\nfilm=%s\r\nfav=",
+        set_res,set_mode,set_auto,set_lastn,set_render.halation,set_render.grain,set_render.cache,
         stock_count&&selected_stock<stock_count?stock_paths[selected_stock]+8:"");
     for(i=0;i<stock_count;i++){
         n=strlen(t);

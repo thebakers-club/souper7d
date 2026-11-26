@@ -12,6 +12,9 @@
 #include <dirent.h>
 #include <sys/stat.h>
 #include <sys/time.h>
+#ifdef _WIN32
+#include <direct.h>
+#endif
 extern char STUB_ROOT[256];
 static inline void stub_path(const char *p,char *out){
     if(!strncmp(p,"A:/",3))p+=3;
@@ -22,8 +25,8 @@ static inline void stub_path(const char *p,char *out){
 #define IS_ERROR(p) ((uintptr_t)(p)&1)
 #define CBR_RET_CONTINUE 0
 struct fio_file{uint32_t mode,size,timestamp,off_0x0c;char name[128];};
-struct fio_dirent{DIR *d;};
-struct card_info{int file_number;};
+struct fio_dirent{DIR *d;char path[512];};
+struct card_info{int file_number,folder_number;};
 struct menu_entry{int unused;};
 struct lens_info_stub{unsigned job_state;};
 extern struct lens_info_stub lens_info;
@@ -39,11 +42,30 @@ static inline int FIO_GetFileSize(const char *p,uint32_t *s){char q[512];struct 
 static inline int FIO_RemoveFile(const char *p){char q[512];stub_path(p,q);return unlink(q);}
 /* Canon's rename is assumed to refuse an existing target; the code checks first */
 static inline int FIO_RenameFile(const char *a,const char *b){char q[512],r[512];struct stat st;stub_path(a,q);stub_path(b,r);if(!stat(r,&st))return -1;return rename(q,r);}
-static inline int FIO_CreateDirectory(const char *p){char q[512];stub_path(p,q);return mkdir(q,0755);}
+static inline int FIO_CreateDirectory(const char *p)
+{
+    char q[512];stub_path(p,q);
+#ifdef _WIN32
+    return _mkdir(q);
+#else
+    return mkdir(q,0755);
+#endif
+}
 static inline int is_file(const char *p){char q[512];struct stat st;stub_path(p,q);return !stat(q,&st)&&S_ISREG(st.st_mode);}
 static inline int is_dir(const char *p){char q[512];struct stat st;stub_path(p,q);return !stat(q,&st)&&S_ISDIR(st.st_mode);}
-static inline int stub_next(struct fio_dirent *d,struct fio_file *f){struct dirent *e;while((e=readdir(d->d))){memset(f,0,sizeof *f);snprintf(f->name,sizeof f->name,"%s",e->d_name);if(e->d_type==DT_DIR)f->mode=ATTR_DIRECTORY;return 0;}return -1;}
-static inline struct fio_dirent *FIO_FindFirstEx(const char *p,struct fio_file *f){char q[512];static struct fio_dirent d;stub_path(p,q);d.d=opendir(q);if(!d.d)return (struct fio_dirent*)1;if(stub_next(&d,f))memset(f,0,sizeof *f);return &d;}
+static inline int stub_next(struct fio_dirent *d,struct fio_file *f)
+{
+    struct dirent *e=readdir(d->d);
+    struct stat st;
+    char path[sizeof d->path+sizeof e->d_name+1];
+    if(!e)return -1;
+    memset(f,0,sizeof *f);
+    snprintf(f->name,sizeof f->name,"%s",e->d_name);
+    snprintf(path,sizeof path,"%s/%s",d->path,e->d_name);
+    if(stat(path,&st)==0&&S_ISDIR(st.st_mode))f->mode=ATTR_DIRECTORY;
+    return 0;
+}
+static inline struct fio_dirent *FIO_FindFirstEx(const char *p,struct fio_file *f){static struct fio_dirent d;stub_path(p,d.path);d.d=opendir(d.path);if(!d.d)return (struct fio_dirent*)1;if(stub_next(&d,f))memset(f,0,sizeof *f);return &d;}
 static inline int FIO_FindNextEx(struct fio_dirent *d,struct fio_file *f){return stub_next(d,f);}
 static inline void FIO_FindClose(struct fio_dirent *d){closedir(d->d);}
 static inline void *fio_malloc(size_t n){return malloc(n);}
@@ -52,7 +74,11 @@ static inline void *tmp_malloc(size_t n){return malloc(n);}
 static inline void msleep(int ms){(void)ms;}
 static inline int task_create(const char *n,int pr,int st,void (*fn)(void*),void *a){(void)n;(void)pr;(void)st;fn(a);return 0;}
 static inline void NotifyBox(int ms,const char *fmt,...){(void)ms;(void)fmt;}
-static inline const char *get_dcim_dir(void){return "A:/DCIM/100EOS7D";}
+static inline const char *get_dcim_dir(void){
+    static char dir[32];
+    snprintf(dir,sizeof(dir),"A:/DCIM/%03dEOS7D",stub_card.folder_number?stub_card.folder_number:100);
+    return dir;
+}
 static inline struct card_info *get_shooting_card(void){return &stub_card;}
 static inline int get_ms_clock(void){struct timeval t;gettimeofday(&t,0);return (int)(t.tv_sec*1000+t.tv_usec/1000);}
 static inline uint64_t get_us_clock(void){struct timeval t;gettimeofday(&t,0);return (uint64_t)t.tv_sec*1000000+t.tv_usec;}
